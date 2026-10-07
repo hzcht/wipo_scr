@@ -1,0 +1,118 @@
+# Effective configuration. Every key here is optional: a missing file means the
+# built-in defaults, and any key can be overridden on the command line.
+#
+#   wipos.exe -config config.toml -threads 5 -max-pages 3
+#
+# Values are read as written below (defaults < this file < flags).
+
+# --- what to collect -------------------------------------------------------
+
+# Text file with one search term per line. '#' starts a comment. A term that is
+# already in done.lst is skipped; failed.lst is retried.
+input = "task.txt"
+
+# Where the collected result pages land. One file per page:
+# <query>_p1.raw, <query>_p2.raw, ... and with save_full also <query>_full.html.
+data_dir = "./data"
+
+# "date \t query \t count" — one line per collected query, count taken from the
+# pager (the total for the whole query, not just the last page).
+results_file = "results.txt"
+
+# "date time \t query \t <grid columns>" — one line per trademark record. This
+# is the file to load into a table; it is separate from results.txt on purpose,
+# so the counts stay readable and the rows stay machine-friendly.
+rows_file = "trademarks.tsv"
+
+# The queries already collected. This is what makes a run resumable: it is read
+# at startup and appended to as queries finish, so it has to stay where it is.
+done_file = "done.lst"
+
+# The queries that ran out of attempts. They are retried on the next run, so
+# this is a record of what to look at, not a blacklist.
+failed_file = "failed.lst"
+
+# --- how hard to push ------------------------------------------------------
+
+# Concurrent browsers. Each one owns a persistent Chromium profile, so this is
+# also the number of windows and roughly the number of Chromium processes.
+# 2-4 is the stable range on this box; beyond that Windows starts thrashing.
+threads = 8
+
+# Attempts per query before it goes to failed.lst. A failed query is retried on
+# the next run, so this only decides when a run gives up on it.
+max_attempts = 18
+
+# Grid page size: the site offers 10, 30, 60 and 100. 100 is the difference
+# between one page load and ten for a large result set.
+rows_per_page = 100
+
+# Cap on result pages per query. 0 = walk every page.
+max_pages = 0
+
+# Minimum pause between two search submits from the same IP, plus jitter. WIPO
+# scores the source IP, so this is the main brake on getting blocked. Set the
+# gap to 0 to crawl at full speed and accept the block risk.
+submit_gap_ms = 3000
+submit_jitter_ms = 2500
+
+# Base pause between two queries in one worker, plus jitter. The gap above
+# applies per IP, this one per worker.
+task_pause_ms = 200
+task_pause_jitter_ms = 400
+
+# --- paths and proxies -----------------------------------------------------
+
+# One proxy per line ('#' comments allowed): http://, https://, socks4://,
+# socks5://. Duplicates are dropped at startup. Every entry is health-checked
+# before the first browser starts, and a missing or empty file means direct
+# connections — which does not work from this host, WIPO does not answer a bare
+# IP. The log says which way it went.
+#
+# This is a snapshot of the working list from E:\proj\oc_scr\proxy.lst: mostly
+# scraped public endpoints, so most of it is dead and the local entries at the
+# top are what actually carries the run.
+proxy_list = "proxy.lst"
+proxy_probe_url = "https://www3.wipo.int/madrid/monitor/en/"
+
+# One persistent Chromium profile per worker: cookies, local storage and the
+# pinned fingerprint (user agent, locale, viewport) survive attempts and
+# restarts. Wiping a profile directory is a legitimate way to start over.
+profiles_dir = "profiles"
+
+# Extra user agents to draw from, one per line. The built-in list is recent
+# desktop Chrome only — Playwright drives a recent Chromium, so an old Firefox
+# or Safari string next to a Chrome engine is a mismatch signal on its own.
+ua_file = "ua.txt"
+
+# --- what to keep ----------------------------------------------------------
+
+# Windows on screen. A headless browser is a louder bot signal — but page.PDF
+# only works headless, so save_pdf needs it.
+headless = false
+
+# The raw results grid per page. This is what the TSV rows are parsed from and
+# the only thing worth keeping if a query has to be re-parsed later.
+save_grid = true
+
+# The whole results page per query. ~0.5 MB each and mostly redundant once the
+# grid is stored, so it is off.
+save_full = true
+
+# Print the first results page to <query>.pdf. Chromium only prints headless;
+# in a headed run the call is skipped with a log line instead of failing per
+# query.
+save_pdf = false
+
+# --- timeouts and block markers -------------------------------------------
+
+# Caps a single page load and the wait for a results grid to appear or change.
+nav_timeout_ms = 120000
+results_timeout_ms = 180000
+
+# Markers found in a page body, "action@::@text", one per line: sleepN, skip or
+# pauseAll. See errors.lst. A missing file disables marker handling.
+errors_template = "errors.lst"
+
+# How long a pauseAll marker freezes every worker's intake.
+all_threads_pause_duration = 300

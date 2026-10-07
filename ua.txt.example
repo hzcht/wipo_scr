@@ -1,0 +1,8 @@
+# Extra user agent strings for the pool, one per line, '#' starts a comment.
+#
+# Only recent desktop Chrome is listed on purpose: Playwright drives a recent
+# Chromium, and a Firefox or Safari string under a Chrome engine is a mismatch
+# signal on its own. Extend this file if the site starts serving a newer Chrome
+# than the built-in list knows about.
+#
+# Leave it empty to use the built-in list only.
