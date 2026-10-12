@@ -25,10 +25,10 @@ const SelectURL = "https://www3.wipo.int/madrid/monitor/jsp/select.jsp"
 var ErrNotJSON = errors.New("replay: response is not a result page")
 
 // ErrBlocked marks a 403 refusal: the endpoint's IP was forbidden, even though
-// the body carries WIPO's generic application-error sentence. It is separated
-// from ErrAppError because the two need opposite treatment — a refusal rotates
-// the proxy, the app error is requeued on it — and from ErrNotJSON so it does
-// not send the query through the browser fallback first.
+// the body carries WIPO's generic application-error sentence. It is separate
+// from ErrAppError only so the logs can name the refusal; both rotate the proxy.
+// It is kept apart from ErrNotJSON so it does not send the query through the
+// browser fallback first.
 var ErrBlocked = errors.New("replay: the request was forbidden (403)")
 
 // Client is one HTTP session against the monitor: a cookie jar, one user
@@ -137,9 +137,8 @@ func (c *Client) Search(query string, start, rows int) (*Page, error) {
 		return page, nil
 	}
 	// Site's own application error, a 403 refusal, or a non-JSON response: do
-	// not retry with a fresh session. A fresh session hits the same error; the
-	// first two even need opposite handling (requeue vs. rotate), which the
-	// worker does.
+	// not retry with a fresh session. A fresh session hits the same error, and
+	// the first two are bans — the worker cools the proxy down and rotates it.
 	if errors.Is(err, ErrNotJSON) || errors.Is(err, site.ErrAppError) || errors.Is(err, ErrBlocked) {
 		return nil, err
 	}
@@ -180,10 +179,10 @@ func (c *Client) post(form string) ([]byte, error) {
 	if site.IsForbidden(string(raw)) {
 		return nil, fmt.Errorf("%w: %d bytes %s", ErrBlocked, len(raw), site.TrimSnippet(string(raw), 160))
 	}
-	// WIPO's own application error page, whatever the status line says. It is
-	// the site's fault, not the endpoint's, so it must not read as a transport
-	// failure (the proxy would be charged) or as ErrNotJSON (the query would be
-	// sent through a pointless browser fallback). The worker requeues it.
+	// WIPO's own application error page, whatever the status line says. It must
+	// not read as a transport failure (the proxy would be charged a full fail)
+	// or as ErrNotJSON (the query would be sent through a pointless browser
+	// fallback). The worker treats it as a ban and rotates the proxy.
 	if site.IsAppError(string(raw)) {
 		return nil, fmt.Errorf("%w: %d bytes %s", site.ErrAppError, len(raw), site.TrimSnippet(string(raw), 160))
 	}

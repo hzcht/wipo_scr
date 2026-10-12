@@ -377,13 +377,15 @@ func (w *worker) handle(t queue.Task) {
 					log.Printf("task %q attempt %d: %v -> requeued (block streak %d, took %s)",
 						t.Name, t.Attempts, res.err, w.blockRuns, took)
 				case site.KindAppError:
-					// WIPO's own "An error occurred processing your request":
-					// its fault, not the endpoint's, and usually transient.
-					// Nobody is charged, nothing is cooled down — the query is
-					// simply put back, and its checkpoint makes the retry
-					// resume where the walk stopped.
-					log.Printf("task %q attempt %d: %v -> requeued (WIPO application error, took %s)",
-						t.Name, t.Attempts, res.err, took)
+					// WIPO's "An error occurred processing your request" window
+					// is treated as a ban: in practice it comes with a blocked
+					// endpoint, so the proxy is cooled down and rotated like any
+					// other wall. The checkpoint is kept, so a retry on the new
+					// endpoint resumes where the walk stopped.
+					w.onBlockHit(t.Name)
+					log.Printf("task %q attempt %d: %v -> requeued (application error, block streak %d, took %s)",
+						t.Name, t.Attempts, res.err, w.blockRuns, took)
+					w.switchProxy()
 				default: // KindMaintenance: nobody's fault, so nobody is charged
 					log.Printf("task %q attempt %d: %v -> requeued (took %s)", t.Name, t.Attempts, res.err, took)
 				}
@@ -396,10 +398,13 @@ func (w *worker) handle(t queue.Task) {
 			}
 			// The same failure as a pageErr, seen by the replay engine: it
 			// arrives as a sentinel instead of a classified page. Same verdict
-			// — requeued, nothing charged, nothing rotated.
+			// as the browser's app-error page — treated as a ban, so the proxy
+			// is cooled down and rotated.
 			if errors.Is(res.err, site.ErrAppError) {
-				log.Printf("task %q attempt %d: %v -> requeued (WIPO application error, took %s)",
+				w.onBlockHit(t.Name)
+				log.Printf("task %q attempt %d: %v -> requeued (application error, rotating proxy, took %s)",
 					t.Name, t.Attempts, res.err, took)
+				w.switchProxy()
 				randomPause(5000, 15000)
 				if t.Sharded() {
 					w.deps.Shards.Reset(t.Name)

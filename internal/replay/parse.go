@@ -112,8 +112,8 @@ func ParsePage(raw []byte) (*Page, error) {
 	}
 	if w.Response == nil {
 		if len(w.Error) > 0 {
-			// The application's own failure, wrapped in a JSON envelope: same
-			// requeue as the HTML page with the same sentence on it.
+			// The application's own failure, wrapped in a JSON envelope: the
+			// same app-error ban as the HTML page with the same sentence on it.
 			if site.IsAppError(string(w.Error)) {
 				return nil, fmt.Errorf("%w: %s", site.ErrAppError, site.TrimSnippet(string(w.Error), 160))
 			}

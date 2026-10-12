@@ -32,9 +32,11 @@ const (
 	// amount of rotating endpoints will help.
 	KindMaintenance
 	// KindAppError is WIPO's own "An error occurred processing your request"
-	// page — the application failed while serving this request. Nobody's fault
-	// either, but unlike maintenance it is usually transient: requeue the query
-	// and carry on from where the walk stopped.
+	// page — the application failed while serving this request. It is classified
+	// apart from a wall so the logs can name it, but the collector treats it the
+	// same way: in practice it comes with a blocked endpoint, so the proxy is
+	// cooled down and rotated, and the walk resumes from its checkpoint on the
+	// new one.
 	KindAppError
 )
 
@@ -74,10 +76,9 @@ func (k Kind) Faulty() bool {
 
 // ErrAppError marks WIPO's own "An error occurred processing your request"
 // answer, wherever it shows up — as the results page after a search, as the
-// home page, or as a JSON error envelope from select.jsp. It is the site's
-// fault, not the endpoint's: the worker requeues the query without charging
-// the proxy, without cooling it down, and without adding to the block streak.
-// The checkpoint is kept, so the retry resumes where the walk stopped.
+// home page, or as a JSON error envelope from select.jsp. The worker treats it
+// as a ban: the proxy is cooled down and rotated, and the checkpoint is kept so
+// the retry on the new endpoint resumes where the walk stopped.
 var ErrAppError = errors.New("the monitor reported an application error")
 
 // appErrorMarkers identify that page. Only the failure sentence is used: the
@@ -96,12 +97,12 @@ func IsAppError(text string) bool {
 	return marker != ""
 }
 
-// IsForbidden reports whether a raw body is an HTTP 403 refusal rather than an
-// answer. WIPO wraps its generic application-error sentence around a
-// "403 Forbidden" page when it refuses the source IP, so the sentence alone
-// reads as the transient site error and would be requeued on the same endpoint
-// forever. The status text is what says the request itself was refused, which
-// is an endpoint problem: the proxy gets rotated.
+// IsForbidden reports whether a raw body is an HTTP 403 refusal. WIPO serves
+// such a page with its generic application-error sentence on it, but a plain
+// "403 Forbidden" stub from a proxy may not carry that sentence at all. The
+// replay client checks this before IsAppError so a bare refusal does not fall
+// through to the browser fallback: a refusal is an endpoint problem, and the
+// proxy is rotated.
 func IsForbidden(text string) bool {
 	return hasForbidden(strings.ToLower(normalize(text)))
 }
@@ -218,14 +219,7 @@ func Classify(p PageSnapshot) (Kind, string) {
 	text := strings.ToLower(normalize(p.Text))
 	title := strings.ToLower(normalize(p.Title))
 
-	// WIPO wraps its generic failure sentence around a 403 refusal, so the
-	// sentence can never be trusted on its own: if the page also says the
-	// request was forbidden, the endpoint's IP is the problem and this is a
-	// block to rotate away from, not a transient site error to requeue.
 	if _, marker := firstMatch(text, appErrorMarkers); marker != "" {
-		if hasForbidden(text) {
-			return KindBlock, "403 forbidden"
-		}
 		return KindAppError, marker
 	}
 	if kind, marker := firstMatch(text, maintenanceMarkers); kind {
