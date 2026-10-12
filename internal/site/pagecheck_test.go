@@ -103,6 +103,15 @@ func TestClassifyRealPages(t *testing.T) {
 			want: KindAppError,
 		},
 		{
+			name: "a 403 wrapped in the app-error sentence is a block, not the app error",
+			in: PageSnapshot{
+				URL:   wipoURL,
+				Title: "403: Forbidden",
+				Text:  appErrorPage + " 403: Forbidden Forbidden",
+			},
+			want: KindBlock,
+		},
+		{
 			name: "error page wins over a stale grid still on screen",
 			in: PageSnapshot{
 				URL:      wipoURL,
@@ -216,6 +225,23 @@ func TestIsAppError(t *testing.T) {
 	for _, healthy := range []string{realHomeText, realNoResultsText, cloudflareWall, maintenancePage} {
 		if IsAppError(healthy) {
 			t.Errorf("healthy or already-classified content mistaken for the app error: %.60q", healthy)
+		}
+	}
+}
+
+// IsForbidden is the replay client's half of the 403 check: it has only the
+// body, and it has to tell a refusal (rotate the proxy) from the app error
+// (requeue on it) and from a real answer (parse it).
+func TestIsForbidden(t *testing.T) {
+	if !IsForbidden(appErrorPage + " 403: Forbidden Forbidden") {
+		t.Error("a 403 wrapped in the app-error sentence was not recognised")
+	}
+	if !IsForbidden("<h1>403 Forbidden</h1>") {
+		t.Error("a plain 403 page was not recognised")
+	}
+	for _, ok := range []string{appErrorPage, realHomeText, realNoResultsText, `{"response":{"numFound":0}}`} {
+		if IsForbidden(ok) {
+			t.Errorf("non-refusal content mistaken for a 403: %.60q", ok)
 		}
 	}
 }

@@ -343,6 +343,22 @@ func (w *worker) handle(t queue.Task) {
 			return
 
 		case res.err != nil:
+			// The replay engine's 403: WIPO refused this endpoint's IP, and the
+			// body wrapped that refusal around the site's generic error
+			// sentence. It is a block, not a transient app error, so the proxy
+			// is cooled down and rotated away from instead of being retried.
+			if errors.Is(res.err, replay.ErrBlocked) {
+				w.onBlockHit(t.Name)
+				log.Printf("task %q attempt %d: %v -> requeued (forbidden, rotating proxy, took %s)",
+					t.Name, t.Attempts, res.err, took)
+				w.switchProxy()
+				randomPause(5000, 15000)
+				if t.Sharded() {
+					w.deps.Shards.Reset(t.Name)
+				}
+				w.deps.Queue.Requeue(t)
+				return
+			}
 			// A page that is not WIPO's own is the one failure the collector has
 			// to grade carefully, because the three kinds have different causes:
 			// a wall is about this IP, a gateway error is about this endpoint,

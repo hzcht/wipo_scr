@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,13 @@ const SelectURL = "https://www3.wipo.int/madrid/monitor/jsp/select.jsp"
 // browser for these instead of retrying blindly.
 var ErrNotJSON = errors.New("replay: response is not a result page")
 
+// ErrBlocked marks a 403 refusal: the endpoint's IP was forbidden, even though
+// the body carries WIPO's generic application-error sentence. It is separated
+// from ErrAppError because the two need opposite treatment — a refusal rotates
+// the proxy, the app error is requeued on it — and from ErrNotJSON so it does
+// not send the query through the browser fallback first.
+var ErrBlocked = errors.New("replay: the request was forbidden (403)")
+
 // Client is one HTTP session against the monitor: a cookie jar, one user
 // agent, and the select.jsp round trip. Sessions are cheap — one GET of the
 // home page — and each worker owns exactly one, the way each browser profile
@@ -42,14 +50,24 @@ func NewClient(ua string) *Client {
 	jar, _ := cookiejar.New(&cookiejar.Options{})
 	return &Client{
 		hc: &http.Client{
-			Jar:     jar,
-			Timeout: 0,
-			Transport: &http.Transport{
-				Proxy:             http.ProxyFromEnvironment,
-				ForceAttemptHTTP2: false,
-			},
+			Jar:       jar,
+			Timeout:   0,
+			Transport: newTransport(http.ProxyFromEnvironment),
 		},
 		ua: ua,
+	}
+}
+
+// newTransport builds the transport the session and every rotation use. TLS
+// verification is off: the pool is a list of intercepting HTTPS proxies whose
+// certificates are self-signed, and Go uses one TLS config for both the tunnel
+// and the site behind it. The precheck makes the same call, so an endpoint that
+// passes it is not then rejected here.
+func newTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	return &http.Transport{
+		Proxy:             proxy,
+		ForceAttemptHTTP2: false,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 	}
 }
 
@@ -68,10 +86,7 @@ func (c *Client) SetProxy(raw string) error {
 		}
 		proxy = http.ProxyURL(u)
 	}
-	c.hc.Transport = &http.Transport{
-		Proxy:             proxy,
-		ForceAttemptHTTP2: false,
-	}
+	c.hc.Transport = newTransport(proxy)
 	return nil
 }
 
@@ -121,9 +136,11 @@ func (c *Client) Search(query string, start, rows int) (*Page, error) {
 	if err == nil {
 		return page, nil
 	}
-	// Site's own application error or non-JSON response: do not retry with a fresh session.
-	// These are not stale-session issues; a fresh session will hit the same error.
-	if errors.Is(err, ErrNotJSON) || errors.Is(err, site.ErrAppError) {
+	// Site's own application error, a 403 refusal, or a non-JSON response: do
+	// not retry with a fresh session. A fresh session hits the same error; the
+	// first two even need opposite handling (requeue vs. rotate), which the
+	// worker does.
+	if errors.Is(err, ErrNotJSON) || errors.Is(err, site.ErrAppError) || errors.Is(err, ErrBlocked) {
 		return nil, err
 	}
 	// Transport trouble or a bad status: start over with a fresh session.
@@ -156,6 +173,12 @@ func (c *Client) post(form string) ([]byte, error) {
 	raw, err := c.doRequest(req)
 	if err != nil {
 		return nil, err
+	}
+	// A 403 refusal comes wrapped in WIPO's application-error sentence, so it
+	// is checked first: it is the endpoint that is blocked, and the worker has
+	// to rotate the proxy rather than requeue on it.
+	if site.IsForbidden(string(raw)) {
+		return nil, fmt.Errorf("%w: %d bytes %s", ErrBlocked, len(raw), site.TrimSnippet(string(raw), 160))
 	}
 	// WIPO's own application error page, whatever the status line says. It is
 	// the site's fault, not the endpoint's, so it must not read as a transport

@@ -96,6 +96,23 @@ func IsAppError(text string) bool {
 	return marker != ""
 }
 
+// IsForbidden reports whether a raw body is an HTTP 403 refusal rather than an
+// answer. WIPO wraps its generic application-error sentence around a
+// "403 Forbidden" page when it refuses the source IP, so the sentence alone
+// reads as the transient site error and would be requeued on the same endpoint
+// forever. The status text is what says the request itself was refused, which
+// is an endpoint problem: the proxy gets rotated.
+func IsForbidden(text string) bool {
+	return hasForbidden(strings.ToLower(normalize(text)))
+}
+
+// hasForbidden looks for the two halves of a 403 refusal in already-normalised
+// text. Both are required and are checked separately so the site's spacing
+// ("403 Forbidden", "403: Forbidden") does not matter.
+func hasForbidden(text string) bool {
+	return strings.Contains(text, "403") && strings.Contains(text, "forbidden")
+}
+
 // PageSnapshot is everything the classifier is allowed to look at. Keeping it a
 // plain struct is what makes the classifier testable without a browser.
 type PageSnapshot struct {
@@ -201,7 +218,14 @@ func Classify(p PageSnapshot) (Kind, string) {
 	text := strings.ToLower(normalize(p.Text))
 	title := strings.ToLower(normalize(p.Title))
 
+	// WIPO wraps its generic failure sentence around a 403 refusal, so the
+	// sentence can never be trusted on its own: if the page also says the
+	// request was forbidden, the endpoint's IP is the problem and this is a
+	// block to rotate away from, not a transient site error to requeue.
 	if _, marker := firstMatch(text, appErrorMarkers); marker != "" {
+		if hasForbidden(text) {
+			return KindBlock, "403 forbidden"
+		}
 		return KindAppError, marker
 	}
 	if kind, marker := firstMatch(text, maintenanceMarkers); kind {
