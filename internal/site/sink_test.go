@@ -16,6 +16,7 @@ func newTestSink(t *testing.T) *Sink {
 		filepath.Join(dir, "results.txt"),
 		filepath.Join(dir, "trademarks.tsv"),
 		dir,
+		0, // no rotation unless a test asks for it
 		true, true,
 	)
 }
@@ -104,7 +105,7 @@ func TestAddRowsDeduplicates(t *testing.T) {
 func TestAddRowsKeepsKeysForARetryAfterAFailedWrite(t *testing.T) {
 	dir := t.TempDir()
 	rowsPath := filepath.Join(dir, "trademarks.tsv")
-	s := NewSink(filepath.Join(dir, "results.txt"), rowsPath, dir, false, false)
+	s := NewSink(filepath.Join(dir, "results.txt"), rowsPath, dir, 0, false, false)
 	row := Row{Brand: "ACME", RecordID: "ROM.1", Number: 0}
 
 	// A write that cannot succeed: the rows file is a directory.
@@ -226,7 +227,7 @@ func TestLoadRestoresRowDedupe(t *testing.T) {
 	before := readFile(t, s1.rowsPath)
 
 	// A fresh sink over the same files, as after a restart.
-	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, true, true)
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, true, true)
 	if err := s2.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -247,6 +248,71 @@ func TestLoadRestoresRowDedupe(t *testing.T) {
 	after := readFile(t, s2.rowsPath)
 	if !strings.Contains(after, "THE NEW ONE") {
 		t.Error("a genuinely new row was dropped as a duplicate")
+	}
+}
+
+// A rows file that grows past the cap is renamed to "<path>.1" and a fresh one
+// is started, so the active file never stays huge.
+func TestRowsRotateOnSize(t *testing.T) {
+	dir := t.TempDir()
+	rowsPath := filepath.Join(dir, "trademarks.tsv")
+	s := NewSink(filepath.Join(dir, "results.txt"), rowsPath, dir, 1, false, false)
+	at := time.Date(2026, 3, 4, 10, 30, 15, 0, time.UTC)
+
+	if err := s.AddRows("acme", []Row{{Brand: "ACME", RecordID: "ROM.1", Number: 0}}, at); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if _, err := os.Stat(rowsPath + ".1"); err != nil {
+		t.Fatalf("first rotation did not happen: %v", err)
+	}
+	if _, err := os.Stat(rowsPath); !os.IsNotExist(err) {
+		t.Errorf("active rows file survived a rotation (err = %v)", err)
+	}
+
+	if err := s.AddRows("acme", []Row{{Brand: "BOLT", RecordID: "ROM.2", Number: 1}}, at); err != nil {
+		t.Fatalf("AddRows (second): %v", err)
+	}
+	if _, err := os.Stat(rowsPath + ".2"); err != nil {
+		t.Fatalf("second rotation did not happen: %v", err)
+	}
+}
+
+// Every rotated part has to be read back on startup. Missing one would let a
+// resumed run re-append rows that older parts already hold.
+func TestLoadReadsRotatedParts(t *testing.T) {
+	dir := t.TempDir()
+	rowsPath := filepath.Join(dir, "trademarks.tsv")
+	rows := []Row{
+		{Brand: "ACE", RecordID: "R1", Number: 1},
+		{Brand: "BOLT", RecordID: "R2", Number: 2},
+	}
+	at := time.Now()
+
+	// A cap of one byte per row splits the two records into parts .1 and .2.
+	s1 := NewSink(filepath.Join(dir, "results.txt"), rowsPath, dir, 1, false, false)
+	for _, r := range rows {
+		if err := s1.AddRows("q", []Row{r}, at); err != nil {
+			t.Fatalf("AddRows: %v", err)
+		}
+	}
+	for _, part := range []string{rowsPath + ".1", rowsPath + ".2"} {
+		if _, err := os.Stat(part); err != nil {
+			t.Fatalf("expected rotated part %s: %v", part, err)
+		}
+	}
+
+	// Restart with rotation effectively off, so the new write is observable in
+	// the active file while the parts stay put.
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 1<<30, false, false)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s2.AddRows("q", append(rows, Row{Brand: "NEW", RecordID: "R3", Number: 3}), at); err != nil {
+		t.Fatalf("AddRows after reload: %v", err)
+	}
+	got := readFile(t, s2.rowsPath)
+	if n := strings.Count(got, "\n"); n != 1 || !strings.Contains(got, "R3") {
+		t.Errorf("resumed write = %d lines, want only the one new row:\n%s", n, got)
 	}
 }
 
@@ -274,7 +340,7 @@ func TestCheckpointSurvivesARestart(t *testing.T) {
 	}
 
 	// Same directory, new sink — as after the process died and came back.
-	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, true, true)
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, true, true)
 	if got := s2.Checkpoint("*", 0, 0); got != 4821 {
 		t.Errorf("Checkpoint after restart = %d, want 4821", got)
 	}

@@ -3,6 +3,7 @@ package site
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,11 @@ import (
 	"sync"
 	"time"
 )
+
+// maxRowLine caps one line the row loader will read. It is far above any real
+// row (a record is well under a kilobyte) but high enough to swallow a torn
+// append and skip it, which is the point: a torn line must not abort startup.
+const maxRowLine = 64 << 20
 
 // Sink owns every file the run writes: the count file, the row file and the
 // saved result pages.
@@ -22,18 +28,24 @@ type Sink struct {
 	resultsPath string
 	rowsPath    string
 	dataDir     string
+	rowsMax     int64                          // rotate the rows file past this many bytes; 0 = never
+	nextPart    int                            // index of the next rotated part (rowsPath.1, .2, ...)
+	rowsBytes   int64                          // size of the active rows file, for the rotation check
 	counted     map[string]struct{}            // queries already in the count file
 	rowSeen     map[string]map[string]struct{} // query -> row keys already written
 	saveGrid    bool
 	saveFull    bool
 }
 
-// NewSink builds a sink. Call Load once before the workers start.
-func NewSink(resultsPath, rowsPath, dataDir string, saveGrid, saveFull bool) *Sink {
+// NewSink builds a sink. rowsMax is the size at which the rows file is rotated
+// (0 = never). Call Load once before the workers start.
+func NewSink(resultsPath, rowsPath, dataDir string, rowsMax int64, saveGrid, saveFull bool) *Sink {
 	return &Sink{
 		resultsPath: resultsPath,
 		rowsPath:    rowsPath,
 		dataDir:     dataDir,
+		rowsMax:     rowsMax,
+		nextPart:    1,
 		counted:     map[string]struct{}{},
 		rowSeen:     map[string]map[string]struct{}{},
 		saveGrid:    saveGrid,
@@ -76,27 +88,81 @@ func (s *Sink) loadCounts() error {
 	return nil
 }
 
-// loadRows rebuilds the dedupe set from an existing row file. A line that does
-// not hold a full row is skipped rather than fatal: the file can end in a
-// half-written line if the previous run died mid-append, and refusing to start
-// over a torn last line would be worse than re-collecting one row.
+// loadRows rebuilds the dedupe set from the row files: every rotated part,
+// oldest to newest, then the active file. It also seeds the rotation state
+// (nextPart, rowsBytes) so an append can keep rotating where the last run left
+// off.
 //
-// The key is recomputed from the written columns rather than stored beside
-// them, so the file format stays exactly what it was.
+// A line that does not hold a full row is skipped rather than fatal: a file can
+// end in a half-written line if the previous run died mid-append, and refusing
+// to start over a torn last line would be worse than re-collecting one row. The
+// key is recomputed from the written columns rather than stored beside them, so
+// the file format stays exactly what it was.
 func (s *Sink) loadRows() error {
-	f, err := os.Open(s.rowsPath)
+	parts, maxPart := s.rowParts()
+	s.nextPart = maxPart + 1
+	for _, p := range parts {
+		if err := s.loadRowsFile(p); err != nil {
+			return err
+		}
+	}
+	if err := s.loadRowsFile(s.rowsPath); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(s.rowsPath); err == nil {
+		s.rowsBytes = fi.Size()
+	}
+	return nil
+}
+
+// rowParts lists the rotated parts of the rows file, "<rows_file>.<n>", from
+// .1 up to the highest index present, and returns that highest index. It scans
+// the whole directory rather than stopping at the first gap: a missing middle
+// part must not hide a later one from the dedupe pass.
+func (s *Sink) rowParts() ([]string, int) {
+	entries, err := os.ReadDir(filepath.Dir(s.rowsPath))
+	if err != nil {
+		return nil, 0
+	}
+	prefix := filepath.Base(s.rowsPath) + "."
+	maxPart := 0
+	for _, e := range entries {
+		suffix, ok := strings.CutPrefix(e.Name(), prefix)
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(suffix)
+		if err != nil || n < 1 {
+			continue
+		}
+		if n > maxPart {
+			maxPart = n
+		}
+	}
+	parts := make([]string, 0, maxPart)
+	for i := 1; i <= maxPart; i++ {
+		parts = append(parts, fmt.Sprintf("%s.%d", s.rowsPath, i))
+	}
+	return parts, maxPart
+}
+
+// loadRowsFile reads one row file into the dedupe set. A missing file is not an
+// error: a fresh run has no rows file, and a rotated part can be absent if the
+// numbering ever skips.
+func (s *Sink) loadRowsFile(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), maxRowLine)
 	for sc.Scan() {
 		fields := strings.Split(sc.Text(), "\t")
 		if len(fields) < 13 {
@@ -117,7 +183,10 @@ func (s *Sink) loadRows() error {
 		}
 		seen[row.Key()] = struct{}{}
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
 }
 
 // Counted reports whether the query is already in the count file.
@@ -180,14 +249,38 @@ func (s *Sink) AddRows(query string, rows []Row, at time.Time) error {
 	if len(fresh) == 0 {
 		return nil
 	}
-	if err := appendLine(s.rowsPath, strings.TrimSuffix(b.String(), "\n")); err != nil {
+	line := strings.TrimSuffix(b.String(), "\n")
+	if err := appendLine(s.rowsPath, line); err != nil {
 		return err
 	}
+	s.rowsBytes += int64(len(line)) + 1 // the trailing newline appendLine adds
 	for _, r := range fresh {
 		seen[r.Key()] = struct{}{}
 	}
 	s.rowSeen[key] = seen
+	s.rotateRows()
 	return nil
+}
+
+// rotateRows archives the active rows file once it passes the size cap and
+// starts a fresh one. It runs under the append mutex, so the rename and the
+// next append cannot race.
+//
+// Rotation is best-effort: a rename that fails only lets the active file grow
+// past the cap, and turning that into an AddRows error would requeue a query
+// whose rows are already on disk.
+func (s *Sink) rotateRows() {
+	if s.rowsMax <= 0 || s.rowsBytes < s.rowsMax {
+		return
+	}
+	part := fmt.Sprintf("%s.%d", s.rowsPath, s.nextPart)
+	if err := os.Rename(s.rowsPath, part); err != nil {
+		log.Printf("rotate rows: %v", err)
+		return
+	}
+	log.Printf("rows file reached %d bytes: %s -> %s", s.rowsBytes, s.rowsPath, part)
+	s.nextPart++
+	s.rowsBytes = 0
 }
 
 // SaveGrid writes the raw grid HTML of one result page. Overwritten, not

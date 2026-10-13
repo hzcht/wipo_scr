@@ -30,6 +30,13 @@ type Config struct {
 	// RowsFile collects one "date time \t query \t <grid columns>" line per
 	// trademark record, tab separated.
 	RowsFile string `toml:"rows_file"`
+	// RowsMaxBytes rotates RowsFile once it grows past this many bytes: the
+	// active file is renamed to "<rows_file>.<n>" (trademarks.tsv.1, .2, ...)
+	// and a fresh one is started, so no single output file grows without bound
+	// and the loader never has to scan a multi-gigabyte TSV in one pass. On
+	// startup every part is read back, oldest to newest, to rebuild the row
+	// dedupe. 0 = never rotate.
+	RowsMaxBytes int64 `toml:"rows_max_bytes"`
 
 	// DoneFile is the append-only list of queries already collected: it is what
 	// makes a run resumable, and it has to stay put between runs.
@@ -194,12 +201,13 @@ func (c Config) Watchdog() time.Duration {
 // DefaultConfig returns the built-in defaults.
 func DefaultConfig() Config {
 	return Config{
-		Input:       "task.txt",
-		DataDir:     "./data",
-		ResultsFile: "results.txt",
-		RowsFile:    "trademarks.tsv",
-		DoneFile:    "done.lst",
-		FailedFile:  "failed.lst",
+		Input:        "task.txt",
+		DataDir:      "./data",
+		ResultsFile:  "results.txt",
+		RowsFile:     "trademarks.tsv",
+		RowsMaxBytes: 256 << 20, // 256 MiB
+		DoneFile:     "done.lst",
+		FailedFile:   "failed.lst",
 
 		Threads:     3,
 		SplitPages:  false,
@@ -271,6 +279,7 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 	dataDir := fs.String("data-dir", "", "directory for the collected result pages")
 	resultsFile := fs.String("results-file", "", "file collecting 'date \\t query \\t count' lines")
 	rowsFile := fs.String("rows-file", "", "file collecting 'date time \\t query \\t <grid columns>' lines")
+	rowsMaxBytes := fs.Int64("rows-max-bytes", 0, "rotate rows-file once it exceeds this many bytes (0 = never)")
 	doneFile := fs.String("done-file", "", "file with the queries already collected (makes a run resumable)")
 	failedFile := fs.String("failed-file", "", "file with the queries that ran out of attempts")
 	threads := fs.Int("threads", 0, "number of concurrent browsers")
@@ -334,6 +343,8 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 			c.ResultsFile = *resultsFile
 		case "rows-file":
 			c.RowsFile = *rowsFile
+		case "rows-max-bytes":
+			c.RowsMaxBytes = *rowsMaxBytes
 		case "done-file":
 			c.DoneFile = *doneFile
 		case "failed-file":
@@ -417,6 +428,8 @@ func (c *Config) Validate() error {
 		return errors.New("results_file is required")
 	case c.RowsFile == "":
 		return errors.New("rows_file is required")
+	case c.RowsMaxBytes < 0:
+		return errors.New("rows_max_bytes must be >= 0 (0 = never rotate)")
 	case c.DoneFile == "":
 		return errors.New("done_file is required")
 	case c.FailedFile == "":
@@ -476,8 +489,8 @@ func (c *Config) Write(path string) error {
 // Log prints the effective configuration so a run leaves a trace of what it
 // was told to do.
 func (c *Config) Log() {
-	log.Printf("config: input=%s data_dir=%s results=%s rows=%s mode=%s threads=%d max_attempts=%d",
-		c.Input, c.DataDir, c.ResultsFile, c.RowsFile, c.Mode, c.Threads, c.MaxAttempts)
+	log.Printf("config: input=%s data_dir=%s results=%s rows=%s rows_max=%s mode=%s threads=%d max_attempts=%d",
+		c.Input, c.DataDir, c.ResultsFile, c.RowsFile, bytesOrOff(c.RowsMaxBytes), c.Mode, c.Threads, c.MaxAttempts)
 	log.Printf("config: proxy_list=%s profiles=%s headless=%v save[grid=%v full=%v pdf=%v]",
 		c.ProxyList, c.ProfilesDir, c.Headless, c.SaveGrid, c.SaveFull, c.SavePDF)
 	log.Printf("config: rows_per_page=%d max_pages=%d submit_gap=%dms(+%d) task_pause=%dms(+%d) timeouts[nav=%dms results=%dms watchdog=%s]",
@@ -489,6 +502,14 @@ func (c *Config) Log() {
 	log.Printf("config: errors_template=%s pause_all=%ds", c.ErrorsTemplate, c.AllThreadsPauseDuration)
 	log.Printf("config: pages %s..%s of every query%s%s", pageBound(c.StartPage), pageBound(c.EndPage),
 		pageNote(c.StartPage, c.EndPage), splitNote(c.SplitPages, c.Threads))
+}
+
+// bytesOrOff renders a rotation cap for the startup log: 0 means "off".
+func bytesOrOff(n int64) string {
+	if n <= 0 {
+		return "off"
+	}
+	return strconv.FormatInt(n>>20, 10) + "MB"
 }
 
 // pageBound renders a page bound for the startup log: 0 means "open".

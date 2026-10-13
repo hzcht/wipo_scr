@@ -138,6 +138,7 @@ func TestValidateRejectsUnusableSettings(t *testing.T) {
 		"no data dir":        func(c *Config) { c.DataDir = "" },
 		"no results file":    func(c *Config) { c.ResultsFile = "" },
 		"no rows file":       func(c *Config) { c.RowsFile = "" },
+		"negative rows max":  func(c *Config) { c.RowsMaxBytes = -1 },
 		"zero threads":       func(c *Config) { c.Threads = 0 },
 		"zero max attempts":  func(c *Config) { c.MaxAttempts = 0 },
 		"odd page size":      func(c *Config) { c.RowsPerPage = 42 },

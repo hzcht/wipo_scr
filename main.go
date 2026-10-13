@@ -166,9 +166,9 @@ func main() {
 	}
 
 	// (7) shared dependencies
-	sink := site.NewSink(cfg.ResultsFile, cfg.RowsFile, cfg.DataDir, cfg.SaveGrid, cfg.SaveFull)
+	sink := site.NewSink(cfg.ResultsFile, cfg.RowsFile, cfg.DataDir, cfg.RowsMaxBytes, cfg.SaveGrid, cfg.SaveFull)
 	if err := sink.Load(); err != nil {
-		log.Fatalf("%s: %v", cfg.ResultsFile, err)
+		log.Fatalf("load output files: %v", err)
 	}
 	q := queue.NewQueue(tasks, cfg.Threads, time.Duration(cfg.AllThreadsPauseDuration)*time.Second)
 	var wg sync.WaitGroup
