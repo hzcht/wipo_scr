@@ -185,16 +185,70 @@ func (w *worker) openContext() (playwright.BrowserContext, playwright.Page, erro
 	})
 }
 
-// close shuts the page and the context, which also ends the browser process.
+// closeGrace bounds how long the graceful browser close may take before the
+// process is killed outright. A wedged renderer makes Close() hang forever, so a
+// merely slow close must not hold the worker.
+const closeGrace = 5 * time.Second
+
+// close ends the worker's browser. The context close is preferred because it
+// tells Chromium to shut down cleanly and flush the profile, but it travels
+// through the Playwright driver and can hang when the renderer or the proxy
+// behind it is wedged. It therefore runs against a deadline: past it, the
+// process is located by its profile directory and killed outright. That backstop
+// is the only thing that stops the empty Chromium window a half-closed browser
+// leaves behind from piling up across a long run.
 func (w *worker) close() {
-	if w.page != nil {
-		_ = w.page.Close()
-		w.page = nil
+	ctx, page := w.ctx, w.page
+	w.ctx, w.page = nil, nil
+	w.pageOK = false
+	if ctx == nil && page == nil {
+		return
 	}
-	if w.ctx != nil {
-		_ = w.ctx.Close()
-		w.ctx = nil
+
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		defer func() {
+			// The driver can panic on a dead channel; a panic here must not
+			// crash the collector, and done is buffered so this never blocks.
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic in browser close: %v", r)
+			}
+			done <- err
+		}()
+		err = closeBrowser(ctx, page)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || errors.Is(err, playwright.ErrTargetClosed) {
+			return
+		}
+		log.Printf("worker %d: browser close failed (%v), force-killing", w.id, err)
+	case <-time.After(closeGrace):
+		log.Printf("worker %d: browser close hung for %s, force-killing", w.id, closeGrace)
 	}
+	browser.Kill(w.profileDir)
+}
+
+// closeBrowser closes the context (which closes its pages and ends the browser)
+// and, as a belt-and-braces, the browser object. It takes the captured handles
+// rather than the worker's fields because close's deadline may abandon this call
+// and it must not then race the worker.
+func closeBrowser(ctx playwright.BrowserContext, page playwright.Page) error {
+	if ctx == nil {
+		if page == nil {
+			return nil
+		}
+		return page.Close()
+	}
+	err := ctx.Close()
+	if b := ctx.Browser(); b != nil {
+		if berr := b.Close(); err == nil && !errors.Is(berr, playwright.ErrTargetClosed) {
+			err = berr
+		}
+	}
+	return err
 }
 
 // healthy reports whether the worker has a usable page.
