@@ -205,6 +205,13 @@ func (w *worker) close() {
 		return
 	}
 
+	// stage is what the attempt was last doing; on the watchdog path this is
+	// the exact place the wedge happened.
+	stage, _ := w.stage.Load().(string)
+	log.Printf("worker %d: closing browser (stage %q, stalled for %s)",
+		w.id, stage, w.stalledFor().Round(time.Second))
+	start := time.Now()
+
 	done := make(chan error, 1)
 	go func() {
 		var err error
@@ -221,10 +228,15 @@ func (w *worker) close() {
 
 	select {
 	case err := <-done:
+		took := time.Since(start).Round(time.Millisecond)
 		if err == nil || errors.Is(err, playwright.ErrTargetClosed) {
+			// If the window still shows up on screen after this line, the
+			// graceful close reported success and the browser stayed behind —
+			// that is the case the force-kill backstop must be widened for.
+			log.Printf("worker %d: browser closed in %s", w.id, took)
 			return
 		}
-		log.Printf("worker %d: browser close failed (%v), force-killing", w.id, err)
+		log.Printf("worker %d: browser close failed after %s (%v), force-killing", w.id, took, err)
 	case <-time.After(closeGrace):
 		log.Printf("worker %d: browser close hung for %s, force-killing", w.id, closeGrace)
 	}

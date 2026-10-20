@@ -3,12 +3,14 @@
 package browser
 
 import (
+	"context"
 	"encoding/base64"
 	"log"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf16"
 )
 
@@ -17,11 +19,17 @@ import (
 // the other two depending on the Playwright version.
 const win32ProcessFilter = "Name='chrome.exe' OR Name='headless_shell.exe' OR Name='chrome-headless-shell.exe'"
 
+// spawnTimeout bounds the external commands. CIM and taskkill take a couple of
+// seconds each on a busy machine; a WMI subsystem gone bad must not stall the
+// worker on the failure path.
+const spawnTimeout = 15 * time.Second
+
 // killBrowsers finds the Chromium processes started on profileDir and terminates
 // them. It is the Windows half of Kill; see kill.go for why it exists.
 func killBrowsers(profileDir string) {
 	pids := browsersOn(profileDir)
 	if len(pids) == 0 {
+		log.Printf("browser: no processes found on %s", profileDir)
 		return
 	}
 	log.Printf("browser: force-killing %d process(es) for %s", len(pids), profileDir)
@@ -33,14 +41,17 @@ func killBrowsers(profileDir string) {
 // browsersOn lists the pids whose command line carries profileDir as its
 // --user-data-dir. The whole listing is one CIM query rather than a query per
 // pid: the process table is large and each CIM call costs the better part of a
-// second.
+// second. Every process that carries a profile is logged, matched or not: when a
+// window survives this call, the log shows the --user-data-dir it actually
+// carries and the comparison can be fixed instead of guessed at.
 func browsersOn(profileDir string) []int {
-	out, err := runPowerShell(listScript())
+	out, err := runPowerShell(listScript(), spawnTimeout)
 	if err != nil {
 		log.Printf("browser: list processes: %v", err)
 		return nil
 	}
 	var pids []int
+	scanned := 0
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimRight(line, "\r")
 		pidField, cmd, ok := strings.Cut(line, "\t")
@@ -51,9 +62,18 @@ func browsersOn(profileDir string) []int {
 		if err != nil {
 			continue
 		}
+		scanned++
+		cmd = strings.TrimSpace(cmd)
+		profile := profileFromCmdLine(cmd)
+		if profile != "" {
+			log.Printf("browser: pid %d carries --user-data-dir %q (expecting %q)", pid, profile, profileDir)
+		}
 		if matchesProfile(cmd, profileDir) {
 			pids = append(pids, pid)
 		}
+	}
+	if len(pids) == 0 && scanned > 0 {
+		log.Printf("browser: %d chromium process(es) running, none on %s", scanned, profileDir)
 	}
 	return pids
 }
@@ -70,21 +90,33 @@ func listScript() string {
 // process tree and killing only the root would orphan the renderers; /F because
 // a wedged Chromium ignores the polite request.
 func taskkill(pid int) {
-	cmd := exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))
+	ctx, cancel := context.WithTimeout(context.Background(), spawnTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))
 	hide(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if msg := strings.TrimSpace(string(out)); msg != "" {
-			log.Printf("browser: taskkill %d: %v: %s", pid, err, msg)
-		}
+	out, err := cmd.CombinedOutput()
+	msg := strings.TrimSpace(string(out))
+	switch {
+	case err != nil && msg != "":
+		log.Printf("browser: taskkill %d: %v: %s", pid, err, msg)
+	case err != nil:
+		log.Printf("browser: taskkill %d: %v", pid, err)
+	case msg != "":
+		log.Printf("browser: taskkill %d: %s", pid, msg)
+	default:
+		log.Printf("browser: taskkill %d: ok", pid)
 	}
 }
 
 // runPowerShell runs script through powershell.exe and returns its stdout. The
 // script travels as -EncodedCommand (base64 UTF-16LE) so no quoting layer can
 // mangle it, and the window is hidden so a background collector never flashes a
-// console.
-func runPowerShell(script string) (string, error) {
-	cmd := exec.Command("powershell.exe",
+// console. cmd is killed once the timeout is up: a wedged WMI subsystem must not
+// hold the failure path.
+func runPowerShell(script string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe",
 		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 		"-EncodedCommand", encodeCommand(script))
 	hide(cmd)
