@@ -1,0 +1,54 @@
+# Changelog
+
+All notable changes to the Wisconsin IP collector are listed here, newest first.
+Each entry points at the commit that carried it.
+
+## 2026-10 — hanging browser windows
+
+### Post-close browser sweep (8166341)
+The graceful context close reported success while the Chromium tree occasionally
+stayed behind, leaving empty windows on the desktop and eating memory. Three
+layers were added:
+
+- after a successful close, one CIM query verifies that no process is left on
+  the worker's profile directory; any leftover is `taskkill`ed with a log line
+  (`process N stayed behind after the close, killing`);
+- the browser's own launch page (about:blank) is reused instead of opening a
+  second tab, so every window holds exactly one tab and never a blank one;
+  init scripts still apply — Playwright evaluates them on every navigation;
+- any popup page the site spawns is closed as it appears (it was the exact
+  shape of the hanging windows), and `main` sweeps every worker profile after
+  the driver is stopped — a killed driver orphans its Chromium children.
+
+### Close diagnostics and timeouts (ef24f15)
+Every browser exit is logged with its stage, stall time and duration; the
+process lookup logs the `--user-data-dir` of every process it sees, the kill
+result of every `taskkill`, and a warning when a window's process carries a
+profile that the matcher did not recognize. PowerShell and taskkill calls run
+under a 15 s timeout so a wedged WMI subsystem cannot hold the failure path.
+
+### Force-kill backstop (9b9e973)
+The worker's close runs against a 5 s deadline: past it, the browser is located
+by its profile directory and terminated outright (`internal/browser` package:
+`Kill`, CIM process matching by `--user-data-dir`, `taskkill /F /T`). Driver-side
+`ErrTargetClosed` responses are treated as success; a panic inside the close
+call cannot take the collector down.
+
+## 2026-10-13 — output rotation (1d07315)
+`trademarks.tsv` is renamed to `trademarks.tsv.N` once it passes a size cap
+(default 256 MB, `rows_max_bytes` in the config or `-rows-max-bytes` on the
+command line). At startup every part is loaded oldest-to-newest, so dedupe
+still works across rotations. The per-line scan cap is 64 MB.
+
+## 2026-10-12 — proxy and ban handling (d5d1b31, cfca157)
+- all TLS verification is skipped: self-signed *proxy* certificates are a fact
+  of life and the origin certificate is not verifiable through a MITM anyway;
+- WIPO's `403: Forbidden` counts as a block: cool down, rotate the proxy;
+- the site's "An error occurred processing your request… Contact Madrid"
+  window also counts as a ban.
+
+## 2026-10-07 — initial collector (e1f0aef)
+Persistent per-worker Chromium profiles behind rotating proxies, keyword and
+owner search flows, grid/row collection with rotation, fallback HTTP replay,
+watchdog that kills a wedged attempt, block-streak profile wipes, proxy health
+probing and rate gates per proxy.
