@@ -129,6 +129,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("playwright run: %v", err)
 	}
+	// Registered before pw.Stop on purpose: defers run in reverse, so this
+	// sweeps the profile directories after the driver is gone. Playwright's
+	// stop kills the node driver process, not the Chromium tree below it — a
+	// driver killed on a hard exit leaves every worker's window behind.
+	defer browser.SweepAll(cfg.ProfilesDir)
 	defer func() { _ = pw.Stop() }()
 
 	// (6) what is already handled

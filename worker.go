@@ -230,10 +230,12 @@ func (w *worker) close() {
 	case err := <-done:
 		took := time.Since(start).Round(time.Millisecond)
 		if err == nil || errors.Is(err, playwright.ErrTargetClosed) {
-			// If the window still shows up on screen after this line, the
-			// graceful close reported success and the browser stayed behind —
-			// that is the case the force-kill backstop must be widened for.
 			log.Printf("worker %d: browser closed in %s", w.id, took)
+			// The close said success, but driver-side success is not proof the
+			// process tree followed: a renderer wedged by a dead proxy can make
+			// Chromium stay behind, showing its empty tab. This check costs one
+			// CIM query and is what guarantees the window does not pile up.
+			browser.Sweep(w.profileDir)
 			return
 		}
 		log.Printf("worker %d: browser close failed after %s (%v), force-killing", w.id, took, err)

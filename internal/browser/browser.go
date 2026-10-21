@@ -294,11 +294,32 @@ func LaunchPersistent(pw *playwright.Playwright, opts LaunchOptions) (playwright
 			return nil, nil, err
 		}
 	}
-	page, err := ctx.NewPage()
-	if err != nil {
-		_ = ctx.Close()
-		return nil, nil, err
+	// The context launches with its own about:blank page; using it instead of
+	// opening a tab after launch gives every browser window exactly one tab.
+	// Init scripts still apply: Playwright evaluates them on every navigation,
+	// not only when a page is created.
+	pages := ctx.Pages()
+	page := playwright.Page(nil)
+	if len(pages) > 0 {
+		page = pages[0]
+	} else {
+		page, err = ctx.NewPage()
+		if err != nil {
+			_ = ctx.Close()
+			return nil, nil, err
+		}
 	}
+	// Nothing the collector does opens a popup, so one that appears belongs to
+	// the site — a consent or attachment window — and is the exact shape of the
+	// hanging about:blank windows on the desktop. It is closed the moment it
+	// spawns; the working page is never touched.
+	mainPage := page
+	ctx.On("page", func(p playwright.Page) {
+		if p == mainPage {
+			return
+		}
+		_ = p.Close()
+	})
 	traceRequests(ctx)
 	return ctx, page, nil
 }

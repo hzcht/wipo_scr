@@ -24,27 +24,38 @@ const win32ProcessFilter = "Name='chrome.exe' OR Name='headless_shell.exe' OR Na
 // worker on the failure path.
 const spawnTimeout = 15 * time.Second
 
-// killBrowsers finds the Chromium processes started on profileDir and terminates
-// them. It is the Windows half of Kill; see kill.go for why it exists.
-func killBrowsers(profileDir string) {
-	pids := browsersOn(profileDir)
+// killWindows force-kills the processes of the wanted profiles and logs
+// everything it can: it runs on the failure path, where the log is the only
+// record of why the window survived. It is the Windows half of Kill; see
+// kill.go.
+func killWindows(wanted map[string]struct{}, label string) {
+	pids := matchedPids(wanted, true)
 	if len(pids) == 0 {
-		log.Printf("browser: no processes found on %s", profileDir)
+		log.Printf("browser: no processes found on %s", label)
 		return
 	}
-	log.Printf("browser: force-killing %d process(es) for %s", len(pids), profileDir)
+	log.Printf("browser: force-killing %d process(es) for %s", len(pids), label)
 	for _, pid := range pids {
 		taskkill(pid)
 	}
 }
 
-// browsersOn lists the pids whose command line carries profileDir as its
-// --user-data-dir. The whole listing is one CIM query rather than a query per
-// pid: the process table is large and each CIM call costs the better part of a
-// second. Every process that carries a profile is logged, matched or not: when a
-// window survives this call, the log shows the --user-data-dir it actually
+// sweepWindows kills any process on one of the wanted profiles, and says
+// nothing when there is none — Sweep runs on the happy path.
+func sweepWindows(wanted map[string]struct{}) {
+	for _, pid := range matchedPids(wanted, false) {
+		log.Printf("browser: process %d stayed behind after the close, killing", pid)
+		taskkill(pid)
+	}
+}
+
+// matchedPids lists the pids whose command line carries a --user-data-dir that
+// is in the wanted set. The whole listing is one CIM query rather than a query
+// per pid: the process table is large and each CIM call costs the better part
+// of a second. On the failure path (verbose) every process is logged, matched or
+// not: when a window survives, the log shows the --user-data-dir it actually
 // carries and the comparison can be fixed instead of guessed at.
-func browsersOn(profileDir string) []int {
+func matchedPids(wanted map[string]struct{}, verbose bool) []int {
 	out, err := runPowerShell(listScript(), spawnTimeout)
 	if err != nil {
 		log.Printf("browser: list processes: %v", err)
@@ -65,17 +76,31 @@ func browsersOn(profileDir string) []int {
 		scanned++
 		cmd = strings.TrimSpace(cmd)
 		profile := profileFromCmdLine(cmd)
-		if profile != "" {
-			log.Printf("browser: pid %d carries --user-data-dir %q (expecting %q)", pid, profile, profileDir)
+		if profile == "" {
+			continue
 		}
-		if matchesProfile(cmd, profileDir) {
+		_, want := wanted[normalizePath(profile)]
+		if verbose {
+			log.Printf("browser: pid %d carries --user-data-dir %q (expecting %q)",
+				pid, profile, strings.Join(keys(wanted), " or "))
+		}
+		if want {
 			pids = append(pids, pid)
 		}
 	}
-	if len(pids) == 0 && scanned > 0 {
-		log.Printf("browser: %d chromium process(es) running, none on %s", scanned, profileDir)
+	if verbose && len(pids) == 0 && scanned > 0 {
+		log.Printf("browser: %d chromium process(es) running, none on %s",
+			scanned, strings.Join(keys(wanted), " or "))
 	}
 	return pids
+}
+
+func keys(wanted map[string]struct{}) []string {
+	out := make([]string, 0, len(wanted))
+	for k := range wanted {
+		out = append(out, k)
+	}
+	return out
 }
 
 // listScript emits one "pid<TAB>commandline" line per matching process. The tab

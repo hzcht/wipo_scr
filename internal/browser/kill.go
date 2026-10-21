@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -16,7 +17,7 @@ import (
 // terminates them outright. It is best-effort: a caller that only wanted a
 // browser gone must never be failed by it.
 //
-// killBrowsers is the platform half; see kill_windows.go.
+// killWindows is the platform half; see kill_windows.go.
 func Kill(profileDir string) {
 	if profileDir == "" {
 		return
@@ -24,7 +25,46 @@ func Kill(profileDir string) {
 	if abs, err := filepath.Abs(profileDir); err == nil {
 		profileDir = abs
 	}
-	killBrowsers(profileDir)
+	killWindows(map[string]struct{}{normalizePath(profileDir): {}}, profileDir)
+}
+
+// Sweep is the post-close check: the graceful close reported success, so any
+// process still on this profile is a browser that stayed behind. Unlike Kill it
+// is silent when there is nothing to do — it runs on the happy path, once per
+// browser exit.
+func Sweep(profileDir string) {
+	if profileDir == "" {
+		return
+	}
+	if abs, err := filepath.Abs(profileDir); err == nil {
+		profileDir = abs
+	}
+	sweepWindows(map[string]struct{}{normalizePath(profileDir): {}})
+}
+
+// SweepAll sweeps every worker profile under root. main defers it for the very
+// end: a driver killed on a crash exit leaves each worker's browser running,
+// and at that point no graceful close is coming for them.
+func SweepAll(root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	wanted := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, e.Name())
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		wanted[normalizePath(path)] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return
+	}
+	sweepWindows(wanted)
 }
 
 // profileFromCmdLine extracts the --user-data-dir value out of a Chromium
@@ -51,16 +91,11 @@ func profileFromCmdLine(cmd string) string {
 	return v
 }
 
-// matchesProfile reports whether cmd is the Chromium command line that was
-// started on profileDir. Matching is case-insensitive and separator-agnostic,
-// and both sides are trimmed of a trailing separator, because Windows paths do
-// not compare cleanly by byte. The comparison is exact rather than a prefix:
-// worker-1 must not match worker-10.
-func matchesProfile(cmd, profileDir string) bool {
-	got := normalizePath(profileFromCmdLine(cmd))
-	return got != "" && got == normalizePath(profileDir)
-}
-
+// Profile directories are compared through normalizePath: matched pids are the
+// ones whose extracted directory normalizes to a wanted one. Normalization is
+// case-insensitive and separator-agnostic, and both sides are trimmed of a
+// trailing separator, because Windows paths do not compare cleanly by byte. The
+// comparison is exact rather than a prefix: worker-1 must not match worker-10.
 func normalizePath(p string) string {
 	p = strings.ToLower(strings.TrimSpace(p))
 	p = strings.ReplaceAll(p, "/", "\\")
