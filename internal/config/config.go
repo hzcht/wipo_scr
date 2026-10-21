@@ -38,6 +38,13 @@ type Config struct {
 	// dedupe. 0 = never rotate.
 	RowsMaxBytes int64 `toml:"rows_max_bytes"`
 
+	// SweepSecs is how often the collector re-checks the worker profiles for
+	// a Chromium process that outlived its close, and kills it. The graceful
+	// close, the post-close sweep and the popup closer should leave no window
+	// behind; this pass is the broom for whatever still slips through. One
+	// sweep is a native process scan, milliseconds each. 0 = off.
+	SweepSecs int64 `toml:"sweep_secs"`
+
 	// DoneFile is the append-only list of queries already collected: it is what
 	// makes a run resumable, and it has to stay put between runs.
 	DoneFile string `toml:"done_file"`
@@ -206,6 +213,7 @@ func DefaultConfig() Config {
 		ResultsFile:  "results.txt",
 		RowsFile:     "trademarks.tsv",
 		RowsMaxBytes: 256 << 20, // 256 MiB
+		SweepSecs:    180,       // reap a leftover window within three minutes
 		DoneFile:     "done.lst",
 		FailedFile:   "failed.lst",
 
@@ -280,6 +288,7 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 	resultsFile := fs.String("results-file", "", "file collecting 'date \\t query \\t count' lines")
 	rowsFile := fs.String("rows-file", "", "file collecting 'date time \\t query \\t <grid columns>' lines")
 	rowsMaxBytes := fs.Int64("rows-max-bytes", 0, "rotate rows-file once it exceeds this many bytes (0 = never)")
+	sweepSecs := fs.Int64("sweep-secs", 0, "seconds between background sweeps for leftover browser windows (0 = off)")
 	doneFile := fs.String("done-file", "", "file with the queries already collected (makes a run resumable)")
 	failedFile := fs.String("failed-file", "", "file with the queries that ran out of attempts")
 	threads := fs.Int("threads", 0, "number of concurrent browsers")
@@ -345,6 +354,8 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 			c.RowsFile = *rowsFile
 		case "rows-max-bytes":
 			c.RowsMaxBytes = *rowsMaxBytes
+		case "sweep-secs":
+			c.SweepSecs = *sweepSecs
 		case "done-file":
 			c.DoneFile = *doneFile
 		case "failed-file":
@@ -430,6 +441,8 @@ func (c *Config) Validate() error {
 		return errors.New("rows_file is required")
 	case c.RowsMaxBytes < 0:
 		return errors.New("rows_max_bytes must be >= 0 (0 = never rotate)")
+	case c.SweepSecs < 0:
+		return errors.New("sweep_secs must be >= 0 (0 = off)")
 	case c.DoneFile == "":
 		return errors.New("done_file is required")
 	case c.FailedFile == "":
@@ -499,7 +512,7 @@ func (c *Config) Log() {
 	log.Printf("config: proxy[tuning fail_budget=%d cooldown=%ds probe=%dms/%d ref=%dms scale=%.1f..%.1f] probe_url=%s",
 		c.ProxyFailBudget, c.ProxyCooldownMS/1000, c.ProxyProbeTimeoutMS, c.ProxyProbeConcurrency,
 		c.ProxyLatencyRefMS, c.TimeoutScaleMin, c.TimeoutScaleMax, c.ProxyProbeURL)
-	log.Printf("config: errors_template=%s pause_all=%ds", c.ErrorsTemplate, c.AllThreadsPauseDuration)
+	log.Printf("config: errors_template=%s pause_all=%ds sweep_secs=%d (0 = off)", c.ErrorsTemplate, c.AllThreadsPauseDuration, c.SweepSecs)
 	log.Printf("config: pages %s..%s of every query%s%s", pageBound(c.StartPage), pageBound(c.EndPage),
 		pageNote(c.StartPage, c.EndPage), splitNote(c.SplitPages, c.Threads))
 }

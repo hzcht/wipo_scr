@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Kill force-stops the Chromium processes that belong to profileDir.
@@ -65,6 +66,23 @@ func SweepAll(root string) {
 		return
 	}
 	sweepWindows(wanted)
+}
+
+// RunPeriodicSweeps re-checks root for leftover browsers on every tick until
+// stop is closed. It is the broom behind the per-close sweeps: a browser that
+// stayed behind for a reason neither the close nor the popup closer covers dies
+// here on its own, without waiting for the next close event.
+func RunPeriodicSweeps(root string, every time.Duration, stop <-chan struct{}) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			SweepAll(root)
+		}
+	}
 }
 
 // profileFromCmdLine extracts the --user-data-dir value out of a Chromium

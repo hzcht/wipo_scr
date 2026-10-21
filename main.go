@@ -136,6 +136,18 @@ func main() {
 	defer browser.SweepAll(cfg.ProfilesDir)
 	defer func() { _ = pw.Stop() }()
 
+	// Leftovers of a crashed run hold their profile lock and show their empty
+	// window: reap them before the first browser launches, and re-check every
+	// sweep_secs while the run lasts, so anything that slips past the
+	// per-close sweeps dies on its own.
+	browser.SweepAll(cfg.ProfilesDir)
+	if cfg.SweepSecs > 0 {
+		sweepStop := make(chan struct{})
+		defer close(sweepStop)
+		go browser.RunPeriodicSweeps(cfg.ProfilesDir, time.Duration(cfg.SweepSecs)*time.Second, sweepStop)
+		log.Printf("background sweep on every %ds", cfg.SweepSecs)
+	}
+
 	// (6) what is already handled
 	done, err := queue.LoadStore(cfg.DoneFile)
 	if err != nil {

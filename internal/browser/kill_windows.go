@@ -4,24 +4,17 @@ package browser
 
 import (
 	"context"
-	"encoding/base64"
 	"log"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf16"
 )
 
-// win32ProcessFilter selects every process name a Playwright Chromium can run
-// under: the regular channel is chrome.exe, the bundled headless shell is one of
-// the other two depending on the Playwright version.
-const win32ProcessFilter = "Name='chrome.exe' OR Name='headless_shell.exe' OR Name='chrome-headless-shell.exe'"
-
-// spawnTimeout bounds the external commands. CIM and taskkill take a couple of
-// seconds each on a busy machine; a WMI subsystem gone bad must not stall the
-// worker on the failure path.
+// spawnTimeout bounds the external command left in the failure path. taskkill
+// takes a second or two on a busy machine; a wedged one must not stall the
+// worker.
 const spawnTimeout = 15 * time.Second
 
 // killWindows force-kills the processes of the wanted profiles and logs
@@ -41,7 +34,8 @@ func killWindows(wanted map[string]struct{}, label string) {
 }
 
 // sweepWindows kills any process on one of the wanted profiles, and says
-// nothing when there is none — Sweep runs on the happy path.
+// nothing when there is none — Sweep runs on the happy path, and the periodic
+// sweep runs it across every worker profile.
 func sweepWindows(wanted map[string]struct{}) {
 	for _, pid := range matchedPids(wanted, false) {
 		log.Printf("browser: process %d stayed behind after the close, killing", pid)
@@ -50,65 +44,50 @@ func sweepWindows(wanted map[string]struct{}) {
 }
 
 // matchedPids lists the pids whose command line carries a --user-data-dir that
-// is in the wanted set. The whole listing is one CIM query rather than a query
-// per pid: the process table is large and each CIM call costs the better part
-// of a second. On the failure path (verbose) every process is logged, matched or
-// not: when a window survives, the log shows the --user-data-dir it actually
-// carries and the comparison can be fixed instead of guessed at.
+// is in the wanted set. The lookup is one native scan of the process table; the
+// command line of each Chromium is read straight out of the kernel. On the
+// failure path (verbose) every process that carries a profile is logged,
+// matched or not: when a window survives, the log shows the --user-data-dir it
+// actually carries and the comparison can be fixed instead of guessed at.
 func matchedPids(wanted map[string]struct{}, verbose bool) []int {
-	out, err := runPowerShell(listScript(), spawnTimeout)
+	procs, err := chromiumCmdLines()
 	if err != nil {
 		log.Printf("browser: list processes: %v", err)
 		return nil
 	}
 	var pids []int
-	scanned := 0
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimRight(line, "\r")
-		pidField, cmd, ok := strings.Cut(line, "\t")
-		if !ok {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(pidField))
-		if err != nil {
-			continue
-		}
-		scanned++
-		cmd = strings.TrimSpace(cmd)
-		profile := profileFromCmdLine(cmd)
+	for _, p := range procs {
+		profile := profileFromCmdLine(p.cmd)
 		if profile == "" {
 			continue
 		}
 		_, want := wanted[normalizePath(profile)]
 		if verbose {
-			log.Printf("browser: pid %d carries --user-data-dir %q (expecting %q)",
-				pid, profile, strings.Join(keys(wanted), " or "))
+			log.Printf("browser: pid %d carries --user-data-dir %q (expecting %s)",
+				p.pid, profile, wantedLabels(wanted))
 		}
 		if want {
-			pids = append(pids, pid)
+			pids = append(pids, p.pid)
 		}
 	}
-	if verbose && len(pids) == 0 && scanned > 0 {
+	if len(pids) == 0 && verbose && len(procs) > 0 {
 		log.Printf("browser: %d chromium process(es) running, none on %s",
-			scanned, strings.Join(keys(wanted), " or "))
+			len(procs), wantedLabels(wanted))
 	}
 	return pids
 }
 
-func keys(wanted map[string]struct{}) []string {
+func wantedLabels(wanted map[string]struct{}) string {
+	if len(wanted) == 1 {
+		for k := range wanted {
+			return k
+		}
+	}
 	out := make([]string, 0, len(wanted))
 	for k := range wanted {
 		out = append(out, k)
 	}
-	return out
-}
-
-// listScript emits one "pid<TAB>commandline" line per matching process. The tab
-// separator is a literal tab in the single-quoted format string; Win32 command
-// lines never contain one.
-func listScript() string {
-	return "Get-CimInstance Win32_Process -Filter \"" + win32ProcessFilter + "\"" +
-		" | ForEach-Object { '{0}\t{1}' -f $_.ProcessId, $_.CommandLine }"
+	return strings.Join(out, " or ")
 }
 
 // taskkill ends a process and its children. /T matters because the browser is a
@@ -133,34 +112,6 @@ func taskkill(pid int) {
 	}
 }
 
-// runPowerShell runs script through powershell.exe and returns its stdout. The
-// script travels as -EncodedCommand (base64 UTF-16LE) so no quoting layer can
-// mangle it, and the window is hidden so a background collector never flashes a
-// console. cmd is killed once the timeout is up: a wedged WMI subsystem must not
-// hold the failure path.
-func runPowerShell(script string, timeout time.Duration) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "powershell.exe",
-		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-		"-EncodedCommand", encodeCommand(script))
-	hide(cmd)
-	out, err := cmd.Output()
-	return string(out), err
-}
-
 func hide(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-}
-
-// encodeCommand encodes script for PowerShell's -EncodedCommand, which expects
-// base64 over UTF-16LE.
-func encodeCommand(script string) string {
-	units := utf16.Encode([]rune(script))
-	buf := make([]byte, len(units)*2)
-	for i, u := range units {
-		buf[i*2] = byte(u)
-		buf[i*2+1] = byte(u >> 8)
-	}
-	return base64.StdEncoding.EncodeToString(buf)
 }

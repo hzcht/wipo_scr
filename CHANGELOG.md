@@ -3,6 +3,25 @@
 All notable changes to the Wisconsin IP collector are listed here, newest first.
 Each entry points at the commit that carried it.
 
+## 2026-10-21 — instant sweeps
+
+### Native process lookup (8166341 and forward)
+The sweep used to run one `Get-CimInstance` per call through powershell.exe —
+a couple of seconds of module loading and a console host each time. It is now a
+native scan: a Toolhelp snapshot for pids and names, then the command line of
+every Chromium read straight out of its PEB (`ReadProcessMemory`; the
+NtQueryInformationProcess command-line class answers zeroed out on hardened
+builds, so the PEB path is the one that works). A sweep takes milliseconds, and
+no console flashes on the failure path anymore.
+
+### Sweeps on a schedule (same commit)
+- `SweepAll` runs once **before** the first browser launches: leftovers of a
+  crashed run die at startup instead of living until the next close.
+- `sweep_secs` (default 180, `-sweep-secs`, 0 = off) starts a background sweep
+  that repeats while the run lasts — a window that slips past the per-close
+  sweeps is now reaped within minutes on its own.
+- Rotated rows parts (`trademarks.tsv.N`) are gitignored.
+
 ## 2026-10 — hanging browser windows
 
 ### Post-close browser sweep (8166341)

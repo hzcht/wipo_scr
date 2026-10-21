@@ -13,6 +13,7 @@ failed.lst
 errors.lst
 results.txt
 trademarks.tsv
+trademarks.tsv.*
 task.txt
 run.log
 
