@@ -99,19 +99,40 @@ func (s *Sink) loadCounts() error {
 // key is recomputed from the written columns rather than stored beside them, so
 // the file format stays exactly what it was.
 func (s *Sink) loadRows() error {
+	start := time.Now()
 	parts, maxPart := s.rowParts()
 	s.nextPart = maxPart + 1
+	// The pass answers "are these rows already collected?" for the whole run,
+	// so it reads every rotated part before the first query can go out. On a
+	// day-old output directory that is gigabytes of TSV and the only thing the
+	// run would otherwise do in silence — hence a line per part plus the
+	// summary at the end.
+	log.Printf("rows: rebuilding dedupe from %d rotated part(s) and the active file", len(parts))
+	var lines int
 	for _, p := range parts {
-		if err := s.loadRowsFile(p); err != nil {
+		n, err := s.loadRowsFile(p)
+		if err != nil {
 			return err
 		}
+		lines += n
 	}
-	if err := s.loadRowsFile(s.rowsPath); err != nil {
+	n, err := s.loadRowsFile(s.rowsPath)
+	if err != nil {
 		return err
 	}
+	lines += n
 	if fi, err := os.Stat(s.rowsPath); err == nil {
 		s.rowsBytes = fi.Size()
 	}
+
+	s.mu.Lock()
+	unique := 0
+	for _, seen := range s.rowSeen {
+		unique += len(seen)
+	}
+	s.mu.Unlock()
+	log.Printf("rows: %d line(s), %d unique rows, dedupe rebuilt in %s",
+		lines, unique, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -146,21 +167,28 @@ func (s *Sink) rowParts() ([]string, int) {
 	return parts, maxPart
 }
 
-// loadRowsFile reads one row file into the dedupe set. A missing file is not an
-// error: a fresh run has no rows file, and a rotated part can be absent if the
-// numbering ever skips.
-func (s *Sink) loadRowsFile(path string) error {
+// loadRowsFile reads one row file into the dedupe set and returns how many
+// lines it held. A missing file is not an error: a fresh run has no rows file,
+// and a rotated part can be absent if the numbering ever skips. A missing file
+// is also the only thing walked through silently here — the loader logs the
+// size of every part it does read, so a long pass is visibly moving.
+func (s *Sink) loadRowsFile(path string) (int, error) {
+	fi, err := os.Stat(path)
+	if err == nil {
+		log.Printf("rows: loading %s (%d MB)", filepath.Base(path), fi.Size()>>20)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return 0, nil
 		}
-		return fmt.Errorf("%s: %w", path, err)
+		return 0, fmt.Errorf("%s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var lines int
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), maxRowLine)
 	for sc.Scan() {
@@ -182,11 +210,12 @@ func (s *Sink) loadRowsFile(path string) error {
 			s.rowSeen[key] = seen
 		}
 		seen[row.Key()] = struct{}{}
+		lines++
 	}
 	if err := sc.Err(); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return lines, fmt.Errorf("%s: %w", path, err)
 	}
-	return nil
+	return lines, nil
 }
 
 // Counted reports whether the query is already in the count file.
