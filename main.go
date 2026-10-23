@@ -55,6 +55,19 @@ func main() {
 	}
 	cfg.Log()
 
+	// -reindex is a maintenance mode: rebuild the row dedupe index from the
+	// rows files and exit. None of the crawl machinery — proxies, playwright,
+	// workers — is involved, so it runs before any of it starts.
+	if cfg.Reindex {
+		sink := site.NewSink(cfg.ResultsFile, cfg.RowsFile, cfg.DataDir, cfg.RowsMaxBytes, cfg.SaveGrid, cfg.SaveFull)
+		sink.SetReindex(true)
+		if err := sink.Load(); err != nil {
+			log.Fatalf("reindex: %v", err)
+		}
+		log.Printf("reindex done")
+		return
+	}
+
 	if _, err := os.Stat(cfg.Input); err != nil {
 		log.Fatalf("input %s: %v", cfg.Input, err)
 	}

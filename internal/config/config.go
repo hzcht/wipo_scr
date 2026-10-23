@@ -38,6 +38,12 @@ type Config struct {
 	// dedupe. 0 = never rotate.
 	RowsMaxBytes int64 `toml:"rows_max_bytes"`
 
+	// Reindex rebuilds the row dedupe index ("<rows_file>.idx") from the rows
+	// files on startup instead of trusting the index, and exits right after.
+	// It is a verification/repair tool, not a normal run mode: use it after
+	// hand-editing or deleting parts of the rows output.
+	Reindex bool `toml:"reindex"`
+
 	// SweepSecs is how often the collector re-checks the worker profiles for
 	// a Chromium process that outlived its close, and kills it. The graceful
 	// close, the post-close sweep and the popup closer should leave no window
@@ -288,6 +294,7 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 	resultsFile := fs.String("results-file", "", "file collecting 'date \\t query \\t count' lines")
 	rowsFile := fs.String("rows-file", "", "file collecting 'date time \\t query \\t <grid columns>' lines")
 	rowsMaxBytes := fs.Int64("rows-max-bytes", 0, "rotate rows-file once it exceeds this many bytes (0 = never)")
+	reindex := fs.Bool("reindex", false, "rebuild the row dedupe index from the rows files and exit")
 	sweepSecs := fs.Int64("sweep-secs", 0, "seconds between background sweeps for leftover browser windows (0 = off)")
 	doneFile := fs.String("done-file", "", "file with the queries already collected (makes a run resumable)")
 	failedFile := fs.String("failed-file", "", "file with the queries that ran out of attempts")
@@ -354,6 +361,8 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 			c.RowsFile = *rowsFile
 		case "rows-max-bytes":
 			c.RowsMaxBytes = *rowsMaxBytes
+		case "reindex":
+			c.Reindex = *reindex
 		case "sweep-secs":
 			c.SweepSecs = *sweepSecs
 		case "done-file":

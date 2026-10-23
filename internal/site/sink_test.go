@@ -192,6 +192,123 @@ func TestSinkUnderConcurrentWorkers(t *testing.T) {
 	}
 }
 
+// The dedupe index is what makes a restart fast: 8 bytes per row instead of
+// re-scanning gigabytes of TSV. It must be written as rows land, load on the
+// next start, and produce the same dedupe as the full scan would.
+func TestRowIndexWrittenAndLoaded(t *testing.T) {
+	s1 := newTestSink(t)
+	rows := []Row{
+		{Brand: "ACE", RecordID: "R1", Number: 1},
+		{Brand: "BOLT", RecordID: "R2", Number: 2},
+	}
+	if err := s1.AddRows("q", rows, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	raw, err := os.ReadFile(s1.idxPath())
+	if err != nil {
+		t.Fatalf("reading index: %v", err)
+	}
+	if len(raw) != 2*8 {
+		t.Errorf("index holds %d bytes, want 16 (two 8-byte hashes)", len(raw))
+	}
+
+	// Restart: Load takes the index fast path and still refuses the old rows.
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s2.AddRows("q", rows, time.Now()); err != nil {
+		t.Fatalf("AddRows after index load: %v", err)
+	}
+	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 2 {
+		t.Errorf("rows file has %d lines, want 2 (index dedupe failed)", n)
+	}
+}
+
+// An index that is not a whole number of entries cannot be trusted (a crash
+// mid-append), and neither can one that was removed by hand: both must fall
+// back to the full scan and come back with the same dedupe.
+func TestLoadFallsBackWhenIndexIsUnusable(t *testing.T) {
+	s1 := newTestSink(t)
+	rows := []Row{{Brand: "ACE", RecordID: "R1", Number: 1}}
+	if err := s1.AddRows("q", rows, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+
+	for name, sabotage := range map[string]func(*Sink){
+		"odd-sized index": func(s *Sink) {
+			writeFile(t, s.idxPath(), "x") // 1 byte: not a whole hash
+		},
+		"missing index": func(s *Sink) {
+			if err := os.Remove(s.idxPath()); err != nil {
+				t.Fatalf("remove index: %v", err)
+			}
+		},
+	} {
+		s1.seen = map[uint64]struct{}{} // forget the in-memory state, as on restart
+		s1.reindex = false
+		sabotage(s1)
+		s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
+		if err := s2.Load(); err != nil {
+			t.Fatalf("%s: Load: %v", name, err)
+		}
+		if err := s2.AddRows("q", rows, time.Now()); err != nil {
+			t.Fatalf("%s: AddRows after fallback: %v", name, err)
+		}
+		if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 1 {
+			t.Errorf("%s: rows file has %d lines, want 1 (fallback dedupe failed)", name, n)
+		}
+		// The fallback must have healed the index on the way out.
+		if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != 8 {
+			t.Errorf("%s: index not rebuilt (size=%v, err=%v), want 8 bytes", name, fi, err)
+		}
+	}
+}
+
+// -reindex ignores a present index and rebuilds it from the rows files —
+// the verification/repair option after the rows output was edited by hand.
+func TestReindexRebuildsFromRowsFiles(t *testing.T) {
+	s1 := newTestSink(t)
+	rows := []Row{{Brand: "ACE", RecordID: "R1", Number: 1}}
+	if err := s1.AddRows("q", rows, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	// Poison the index with a hash for a row that was never written. Without
+	// reindex the restart trusts it and the row is lost; with reindex the
+	// rows files are the source of truth and the index is rewritten.
+	poison := append([]byte{0, 0, 0, 0, 0, 0, 0, 0}, readFileAsBytes(t, s1.idxPath())...)
+	writeBytes(t, s1.idxPath(), poison)
+
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
+	s2.SetReindex(true)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s2.AddRows("q", rows, time.Now()); err != nil {
+		t.Fatalf("AddRows after reindex: %v", err)
+	}
+	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 1 {
+		t.Errorf("rows file has %d lines, want 1", n)
+	}
+	if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != 8 {
+		t.Errorf("reindex did not rewrite the index (size=%v, err=%v), want 8 bytes", fi, err)
+	}
+}
+
+// The hash must depend on the field boundary: a record id "12" of query "ab"
+// is a different row from record id "21" of query "a".
+func TestRowHashSeparatesFields(t *testing.T) {
+	if rowHash("ab", "12") == rowHash("a", "b12") {
+		t.Error("rowHash collides across the query/rowKey boundary")
+	}
+	if rowHash("q", "x") != rowHash("q", "x") {
+		t.Error("rowHash is not deterministic")
+	}
+	if rowHash("a", "x") == rowHash("b", "x") {
+		t.Error("rowHash ignores the query — different queries would dedupe each other")
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -199,6 +316,22 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(raw)
+}
+
+func readFileAsBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return raw
+}
+
+func writeBytes(t *testing.T, path string, content []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 func writeFile(t *testing.T, path, content string) {

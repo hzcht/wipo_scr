@@ -3,6 +3,32 @@
 All notable changes to the Wisconsin IP collector are listed here, newest first.
 Each entry points at the commit that carried it.
 
+## 2026-10-23 — row dedupe index
+
+### Startup no longer re-scans the rows files
+The dedupe set is now kept beside the rows output as `trademarks.tsv.idx` —
+one 8-byte FNV-1a hash per collected row (~80 MB for ten million rows) instead
+of the row keys as strings (multiple GB of heap). On startup the index is
+loaded directly; the multi-gigabyte TSV scan runs only when the index is
+missing or odd-sized (first run, crash mid-append) and rebuilds it, so every
+run after the first starts in seconds. Rotation is unaffected: parts are only
+read by the rebuild.
+
+- `-reindex` (also `reindex` in the config) forces the rebuild from the rows
+  files and exits right after — the verification/repair option for when the
+  rows output was edited or deleted by hand. The rows files stay the source of
+  truth, the index is a cache of them.
+- an index append that fails is logged and never fails a batch whose rows are
+  already on disk; the next start just falls back to a scan;
+- batch-internal duplicates (the same record twice in one page) are now
+  dropped too.
+
+### Progress in its own file
+A full rebuild reports every 10 s — percent, GB done/total, current file, ETA —
+into `trademarks.tsv.idx.progress-log`, not the run log: the ticks are noise
+that would otherwise accumulate in `run.log` forever. The main log keeps one
+line about the sizes at the start and one summary at the end.
+
 ## 2026-10-21 — instant sweeps
 
 ### Native process lookup (8166341 and forward)
