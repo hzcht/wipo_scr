@@ -90,25 +90,65 @@ func (c *Client) SetProxy(raw string) error {
 	return nil
 }
 
-// doRequest executes req with the client's timeout context and returns the body.
-// The context must stay alive until the body is fully read, so we read it here.
-func (c *Client) doRequest(req *http.Request) ([]byte, error) {
+// doRequest executes req with the client's timeout context and returns the body
+// with its status code. The context must stay alive until the body is fully
+// read, so we read it here.
+//
+// Transport failures are the only errors it reports. What a status means is
+// gradeResponse's decision, because a 403 has to come from the status line: the
+// body of a *successful* answer is the result documents themselves, and those
+// documents legitimately contain anything at all.
+func (c *Client) doRequest(req *http.Request) ([]byte, int, error) {
 	ctx, cancel := context.WithTimeout(req.Context(), c.Timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("replay: HTTP %s (%d bytes)", resp.Status, len(raw))
+	return raw, resp.StatusCode, nil
+}
+
+// gradeResponse decides what a completed answer is. It returns nil when raw is
+// a result payload for ParsePage to decode, and an error the worker already
+// knows how to grade otherwise.
+//
+// The status line decides a refusal — never the body. This is the fix for the
+// failure that cost the run most of its throughput: the old check looked for
+// the substrings "403" and "forbidden" anywhere in the response, and a healthy
+// page of result documents carries both — a mark called "403 FORBIDDEN", a
+// holder named "FORBIDDEN CITY CULTURE DEVELOPMENT", an IRN or a postal code
+// that happens to be 403. About 70% of the attempts in one run were thrown
+// away as blocks while their pages were perfectly good, and every one of them
+// also cooled down a working endpoint.
+//
+// A JSON body is therefore handed straight to ParsePage, which grades it by
+// structure (its error field, its response object) and not by wording. Only a
+// body that is not JSON — an HTML stub from a proxy, a wall, a maintenance
+// screen — is still read as text, because there the wording is all there is.
+func gradeResponse(status int, raw []byte) ([]byte, error) {
+	if status == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: HTTP %d, %d bytes %s", ErrBlocked, status, len(raw), site.TrimSnippet(string(raw), 160))
 	}
-	return raw, nil
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("replay: HTTP %d (%d bytes)", status, len(raw))
+	}
+	peek := strings.TrimLeft(string(raw), "\xef\xbb\xbf \t\r\n")
+	if strings.HasPrefix(peek, "{") || strings.HasPrefix(peek, "[") {
+		return raw, nil
+	}
+	if site.IsForbidden(peek) {
+		return nil, fmt.Errorf("%w: %d bytes %s", ErrBlocked, len(raw), site.TrimSnippet(peek, 160))
+	}
+	if site.IsAppError(peek) {
+		return nil, fmt.Errorf("%w: %d bytes %s", site.ErrAppError, len(raw), site.TrimSnippet(peek, 160))
+	}
+	return nil, fmt.Errorf("%w: %d bytes %.120q", ErrNotJSON, len(raw), peek)
 }
 
 // EnsureSession fetches the home page once so the jar holds a JSESSIONID.
@@ -120,9 +160,12 @@ func (c *Client) EnsureSession() error {
 	}
 	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	_, serr := c.doRequest(req)
+	raw, status, serr := c.doRequest(req)
 	if serr != nil {
 		return serr
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("replay: session: HTTP %d (%d bytes)", status, len(raw))
 	}
 	return nil
 }
@@ -169,26 +212,9 @@ func (c *Client) post(form string) ([]byte, error) {
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Origin", "https://www3.wipo.int")
 	req.Header.Set("Referer", site.HomeURL)
-	raw, err := c.doRequest(req)
+	raw, status, err := c.doRequest(req)
 	if err != nil {
 		return nil, err
 	}
-	// A 403 refusal comes wrapped in WIPO's application-error sentence, so it
-	// is checked first: it is the endpoint that is blocked, and the worker has
-	// to rotate the proxy rather than requeue on it.
-	if site.IsForbidden(string(raw)) {
-		return nil, fmt.Errorf("%w: %d bytes %s", ErrBlocked, len(raw), site.TrimSnippet(string(raw), 160))
-	}
-	// WIPO's own application error page, whatever the status line says. It must
-	// not read as a transport failure (the proxy would be charged a full fail)
-	// or as ErrNotJSON (the query would be sent through a pointless browser
-	// fallback). The worker treats it as a ban and rotates the proxy.
-	if site.IsAppError(string(raw)) {
-		return nil, fmt.Errorf("%w: %d bytes %s", site.ErrAppError, len(raw), site.TrimSnippet(string(raw), 160))
-	}
-	peek := strings.TrimLeft(string(raw), "\xef\xbb\xbf \t\r\n")
-	if !strings.HasPrefix(peek, "{") {
-		return nil, fmt.Errorf("%w: %d bytes %.120q", ErrNotJSON, len(raw), peek)
-	}
-	return raw, nil
+	return gradeResponse(status, raw)
 }

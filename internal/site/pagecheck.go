@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -103,16 +104,30 @@ func IsAppError(text string) bool {
 // replay client checks this before IsAppError so a bare refusal does not fall
 // through to the browser fallback: a refusal is an endpoint problem, and the
 // proxy is rotated.
+//
+// It only ever sees bodies that are not JSON — gradeResponse hands those to the
+// JSON parser instead. Result documents contain both of the words this looks
+// for (a mark named "403 FORBIDDEN", a holder named "FORBIDDEN CITY ..."), and
+// a refusal is decided by the status line anyway; the JSON guard below is the
+// belt to that suspenders, for any caller that forgets.
 func IsForbidden(text string) bool {
 	return hasForbidden(strings.ToLower(normalize(text)))
 }
 
-// hasForbidden looks for the two halves of a 403 refusal in already-normalised
-// text. Both are required and are checked separately so the site's spacing
-// ("403 Forbidden", "403: Forbidden") does not matter.
+// hasForbidden looks for the two halves of a 403 refusal next to each other in
+// already-normalised text: "403 Forbidden", "403: Forbidden", "error 403
+// forbidden". Requiring the adjacency is what keeps the two words from
+// matching when they merely both occur in a long document.
 func hasForbidden(text string) bool {
-	return strings.Contains(text, "403") && strings.Contains(text, "forbidden")
+	if strings.HasPrefix(strings.TrimSpace(text), "{") || strings.HasPrefix(strings.TrimSpace(text), "[") {
+		return false // a JSON payload is data, not an error page
+	}
+	return forbiddenRe.MatchString(text)
 }
+
+// forbiddenRe is the 403/forbidden pair with the punctuation the site and the
+// proxies put between them.
+var forbiddenRe = regexp.MustCompile(`\b403\b\s*(?:[:\-]\s*)?forbidden`)
 
 // PageSnapshot is everything the classifier is allowed to look at. Keeping it a
 // plain struct is what makes the classifier testable without a browser.

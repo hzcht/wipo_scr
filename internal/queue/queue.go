@@ -80,6 +80,11 @@ type Store struct {
 
 // LoadStore reads one name per line into a lowercased set. A missing file
 // yields an empty store, not an error — that is a fresh run.
+//
+// A line may carry more than the name: short.lst holds
+// "query <tab> count <tab> rows <tab> date", and membership is on the first
+// field alone. done.lst and failed.lst have no tabs, so they read exactly as
+// they did before.
 func LoadStore(path string) (*Store, error) {
 	s := &Store{path: path, set: map[string]struct{}{}}
 	raw, err := os.ReadFile(path)
@@ -93,11 +98,19 @@ func LoadStore(path string) (*Store, error) {
 	// with one, and an invisible prefix on the first name means that query is
 	// never recognised as already collected and gets run again.
 	for _, line := range strings.Split(strings.TrimPrefix(string(raw), "\uFEFF"), "\n") {
-		if name := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(line, "\r"))); name != "" {
+		line = strings.TrimSuffix(line, "\r")
+		if name := keyOf(line); name != "" {
 			s.set[name] = struct{}{}
 		}
 	}
 	return s, nil
+}
+
+// keyOf is the membership key of one line: its first tab-separated field,
+// lowercased and trimmed.
+func keyOf(line string) string {
+	name, _, _ := strings.Cut(line, "\t")
+	return strings.ToLower(strings.TrimSpace(name))
 }
 
 // Has reports whether the name is already stored. The comparison is
@@ -119,7 +132,22 @@ func (s *Store) Len() int {
 
 // Append records the name in memory and in the backing file.
 func (s *Store) Append(name string) {
-	key := strings.ToLower(strings.TrimSpace(name))
+	s.appendRecord(name, nil)
+}
+
+// AppendRecord records the name plus extra tab-separated fields, for a file
+// that is meant to be read by a person as well as by the next run: short.lst
+// carries the count the pager promised and the rows that were actually written.
+// Membership is on the name alone, exactly as with Append.
+func (s *Store) AppendRecord(name string, rest ...string) {
+	s.appendRecord(name, rest)
+}
+
+func (s *Store) appendRecord(name string, rest []string) {
+	// The line keeps the spelling it came with — done.lst is a file people read
+	// and edit — while membership is on the lowercased key.
+	line := strings.TrimSpace(name)
+	key := strings.ToLower(line)
 	if key == "" {
 		return
 	}
@@ -129,13 +157,16 @@ func (s *Store) Append(name string) {
 		return
 	}
 	s.set[key] = struct{}{}
+	for _, r := range rest {
+		line += "\t" + r
+	}
 	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		log.Printf("append %s: %v", s.path, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := fmt.Fprintf(f, "%s\n", name); err != nil {
+	if _, err := fmt.Fprintf(f, "%s\n", line); err != nil {
 		log.Printf("append %s: %v", s.path, err)
 	}
 }

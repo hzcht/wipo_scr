@@ -32,6 +32,14 @@ done_file = "done.lst"
 # this is a record of what to look at, not a blacklist.
 failed_file = "failed.lst"
 
+# The queries that reached the end of their results with a page or more fewer
+# rows than the position line promised: "query <tab> count <tab> rows <tab>
+# date". Such a query is counted in results.txt but deliberately NOT added to
+# done_file — the next run walks it again and dedupe fills the hole. A second
+# shortfall in a row is accepted (the gap is in the data, not in the walk) and
+# the line stays as the record of what it never got.
+short_file = "short.lst"
+
 # --- how hard to push ------------------------------------------------------
 
 # Concurrent browsers. Each one owns a persistent Chromium profile, so this is
@@ -96,8 +104,9 @@ headless = false
 save_grid = true
 
 # The whole results page per query. ~0.5 MB each and mostly redundant once the
-# grid is stored, so it is off.
-save_full = true
+# grid is stored — at a large input's size that is hundreds of GB of HTML
+# nobody reads — so it is off by default.
+save_full = false
 
 # Print the first results page to <query>.pdf. Chromium only prints headless;
 # in a headed run the call is skipped with a log line instead of failing per

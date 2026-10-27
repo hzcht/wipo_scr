@@ -3,6 +3,94 @@
 All notable changes to the Wisconsin IP collector are listed here, newest first.
 Each entry points at the commit that carried it.
 
+## 2026-10-26 — data integrity and the memory behind it
+
+### A 403 is read from the status line, never from the body
+The replay client decided a refusal by looking for the substrings `403` and
+`forbidden` anywhere in the response — and a *successful* answer is the result
+documents themselves, which legitimately contain both: a mark called
+`403 FORBIDDEN`, a holder named `FORBIDDEN CITY CULTURE DEVELOPMENT`, an IRN or
+a postal code that happens to be 403. In the run this was measured on, **141 of
+201 attempts (70%)** were thrown away as blocks while their pages were
+perfectly good — each one also cooling down a working endpoint and rotating the
+proxy, so the run collected 19 pages and finished 0 queries in 40 minutes.
+
+- `gradeResponse` now takes the status code from `doRequest`: 403 → blocked,
+  anything else non-200 → transport error, 200 → handed to the JSON parser,
+  which grades it by structure (`response`, `error`) instead of by wording.
+- A body check only runs on something that is **not** JSON — an HTML stub from a
+  proxy, a wall, a maintenance screen — where wording is all there is.
+- `site.IsForbidden` requires the two halves to stand next to each other
+  (`403 Forbidden`, `403: Forbidden`) and refuses JSON outright.
+- Tests carry a realistic 47 KB docs payload with both words inside the data;
+  the old tests only had three-word strings, which is why they passed.
+
+### Every page is held to a contract, and a walk is held against its count
+A hole used to be able to open one page at a time: an empty or clamped answer
+advanced the checkpoint exactly like a full one, while `results.txt` went on
+claiming rows that were never written. Measured on the existing output: 6
+queries short by **28,600 rows**, every gap a multiple of 100 — whole pages.
+
+- replay: the answer must be at the offset that was asked for, must hold rows,
+  and must hold exactly `rows_per_page` unless it is the last page. Any other
+  answer is an error, so the checkpoint cannot move and the attempt is retried.
+- browser: a page whose position line promises rows but parses into none is an
+  error; a page that parses into fewer (the parser drops a record with neither
+  brand nor id) is logged.
+- `finishQuery` refuses to mark a query collected when the walk is short by a
+  page or more: the count is written, the query is **not** added to `done.lst`,
+  its checkpoint is dropped, and `short.lst` records
+  `query<TAB>count<TAB>rows<TAB>date`. The next run re-walks it and dedupe
+  fills only what is missing. A second shortfall in a row is accepted — by then
+  the gap is in the data, not in the walk — and keeps its line as the marker.
+- `max_pages` no longer records a partial walk as collected: the checkpoint
+  stays and a later run continues, which is what the cap is for.
+- the checkpoint now carries the row total beside the page number
+  (`<page>\t<rows>`), so a run that resumes at page 500 still accounts for the
+  499 pages before it. An older page-only checkpoint still reads; the row total
+  is then unknown and the check is skipped rather than guessed.
+- sub-page gaps are accepted on purpose: the site repeats records across a page
+  boundary, and chasing those would be a walk that never ends.
+
+### The dedupe index holds only the queries that are open
+The index was one 8-byte hash per collected row for *everything ever
+collected*: 1.33 GB on disk (~166 M hashes) and ~5.5 GB of RSS a fifth of the
+way into the input, growing linearly — that run cannot finish.
+
+- hashes are now grouped per query in memory and dropped the moment the query
+  is recorded (`Sink.Forget`), so the heap holds the queries in flight.
+- the file is a magic header plus `[query length][query][n][hashes]` blocks. A
+  start reads it end to end, keeps the open queries and rewrites the rest away:
+  a free compaction, because the file had to be read anyway. Startup goes from
+  loading a gigabyte to milliseconds, and the file never grows past the open
+  queries again.
+- a torn tail stops the pass at the last whole block and is truncated away.
+- a file without the header is the old flat layout, which cannot say which query
+  a hash belongs to — it falls back to one full scan of the rows files (progress
+  in `trademarks.tsv.idx.progress-log`), now skipping the rows of finished
+  queries. **The first start after this change performs that scan once.**
+- `-reindex` does the same scan deliberately, and honours `done.lst` too.
+
+### The proxy precheck actually uses the proxy
+- HTTP(S) endpoints must answer **200** (429 accepted: the site is rate
+  limiting, the tunnel works). A 502/407/403 stub used to count as alive and
+  then fail every request of the run.
+- SOCKS5 is checked through a real dial plus an HTTP request over the tunnel,
+  with the deadline the old bare port probe lacked. A port that spoke nothing
+  used to pass in "1 ms" and then refuse every tunneled connection at runtime.
+- SOCKS4 has no client in the toolkit, so it keeps the port probe but is
+  flagged `PortOnly`: the log says the tunnel was not verified, and its
+  handshake never seeds the pool's latency.
+- the probe reads the body, so the seeded latency is a page load rather than a
+  first byte.
+
+### Also
+- `save_full` is off in `config.toml` and `config.toml.example` (the comment
+  already said "off"; the value said `true`) — ~0.5 MB per query over this
+  input is hundreds of GB of HTML nobody reads.
+- `short_file` (`-short-file`, default `short.lst`) joins the config.
+- `Store.AppendRecord` writes a record line while membership stays on the name.
+
 ## 2026-10-23 — row dedupe index
 
 ### Startup no longer re-scans the rows files

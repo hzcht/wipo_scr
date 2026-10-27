@@ -46,7 +46,7 @@ func TestLoadResumesFromExistingCountFile(t *testing.T) {
 	s := newTestSink(t)
 	writeFile(t, s.resultsPath, "2026-03-01\tacme\t10\nbroken line\n2026-03-02\tother\t3\n")
 	before := readFile(t, s.resultsPath)
-	if err := s.Load(); err != nil {
+	if err := s.Load(nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if !s.Counted("acme") || !s.Counted("Other") {
@@ -192,9 +192,15 @@ func TestSinkUnderConcurrentWorkers(t *testing.T) {
 	}
 }
 
-// The dedupe index is what makes a restart fast: 8 bytes per row instead of
-// re-scanning gigabytes of TSV. It must be written as rows land, load on the
-// next start, and produce the same dedupe as the full scan would.
+// idxSize is the on-disk size of an index holding hashes for one query: the
+// magic header plus one "[len][query][n][hashes]" block.
+func idxSize(query string, hashes int) int64 {
+	return int64(len(idxMagic) + 4 + len(query) + 4 + 8*hashes)
+}
+
+// The dedupe index is what makes a restart fast: one block per batch of rows
+// instead of re-scanning gigabytes of TSV. It must be written as rows land,
+// load on the next start, and produce the same dedupe as the full scan would.
 func TestRowIndexWrittenAndLoaded(t *testing.T) {
 	s1 := newTestSink(t)
 	rows := []Row{
@@ -208,13 +214,16 @@ func TestRowIndexWrittenAndLoaded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading index: %v", err)
 	}
-	if len(raw) != 2*8 {
-		t.Errorf("index holds %d bytes, want 16 (two 8-byte hashes)", len(raw))
+	if got, want := int64(len(raw)), idxSize("q", 2); got != want {
+		t.Errorf("index holds %d bytes, want %d (magic + one block for 2 hashes)", got, want)
+	}
+	if !strings.HasPrefix(string(raw), idxMagic) {
+		t.Errorf("index does not start with the %q header", idxMagic)
 	}
 
 	// Restart: Load takes the index fast path and still refuses the old rows.
 	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
-	if err := s2.Load(); err != nil {
+	if err := s2.Load(nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := s2.AddRows("q", rows, time.Now()); err != nil {
@@ -223,6 +232,72 @@ func TestRowIndexWrittenAndLoaded(t *testing.T) {
 	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 2 {
 		t.Errorf("rows file has %d lines, want 2 (index dedupe failed)", n)
 	}
+}
+
+// The index is only worth carrying for queries that are still open. Loading
+// with a done filter must drop the finished query's blocks from the file (a
+// compaction, not a separate pass) and leave the open one's dedupe intact —
+// that is what keeps the index, and the heap behind it, from growing with
+// everything ever collected.
+func TestIndexCompactsFinishedQueriesAway(t *testing.T) {
+	s1 := newTestSink(t)
+	closed := []Row{{Brand: "OLD", RecordID: "R1", Number: 1}}
+	open := []Row{{Brand: "NEW", RecordID: "R2", Number: 1}}
+	if err := s1.AddRows("finished", closed, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if err := s1.AddRows("open", open, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
+	if err := s2.Load(func(q string) bool { return q == "finished" }); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != idxSize("open", 1) {
+		t.Errorf("index size = %d (err=%v), want %d — the finished query's block must be gone",
+			sizeOf(fi), err, idxSize("open", 1))
+	}
+	// The open query still dedupes...
+	if err := s2.AddRows("open", open, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 2 {
+		t.Errorf("rows file has %d lines, want 2 (the open query lost its dedupe)", n)
+	}
+	// ...and a finished query is collected again on purpose: its hashes are
+	// gone, because nothing will ever ask for them while it is in done.lst.
+	if err := s2.AddRows("finished", closed, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 3 {
+		t.Errorf("rows file has %d lines, want 3 (a finished query is re-collected)", n)
+	}
+}
+
+// Forgetting a query releases its hashes: after the query is recorded as done
+// nothing can write it again, so keeping them is what made the index grow to a
+// gigabyte.
+func TestForgetDropsTheQueryHashes(t *testing.T) {
+	s := newTestSink(t)
+	if err := s.AddRows("q", []Row{{Brand: "ACE", RecordID: "R1", Number: 1}}, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if len(s.seen["q"]) != 1 {
+		t.Fatalf("the query holds %d hash(es), want 1", len(s.seen["q"]))
+	}
+	s.Forget("Q")
+	if _, ok := s.seen["q"]; ok {
+		t.Error("Forget did not release the query")
+	}
+	s.Forget("never-seen") // must not panic on an unknown query
+}
+
+func sizeOf(fi os.FileInfo) int64 {
+	if fi == nil {
+		return -1
+	}
+	return fi.Size()
 }
 
 // An index that is not a whole number of entries cannot be trusted (a crash
@@ -237,7 +312,11 @@ func TestLoadFallsBackWhenIndexIsUnusable(t *testing.T) {
 
 	for name, sabotage := range map[string]func(*Sink){
 		"odd-sized index": func(s *Sink) {
-			writeFile(t, s.idxPath(), "x") // 1 byte: not a whole hash
+			writeFile(t, s.idxPath(), "x") // 1 byte: not the format header either
+		},
+		"old flat index": func(s *Sink) {
+			// The pre-block layout: bare hashes, no header, no query to filter by.
+			writeBytes(t, s.idxPath(), make([]byte, 16))
 		},
 		"missing index": func(s *Sink) {
 			if err := os.Remove(s.idxPath()); err != nil {
@@ -245,11 +324,11 @@ func TestLoadFallsBackWhenIndexIsUnusable(t *testing.T) {
 			}
 		},
 	} {
-		s1.seen = map[uint64]struct{}{} // forget the in-memory state, as on restart
+		s1.seen = map[string]map[uint64]struct{}{} // forget the in-memory state, as on restart
 		s1.reindex = false
 		sabotage(s1)
 		s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
-		if err := s2.Load(); err != nil {
+		if err := s2.Load(nil); err != nil {
 			t.Fatalf("%s: Load: %v", name, err)
 		}
 		if err := s2.AddRows("q", rows, time.Now()); err != nil {
@@ -258,9 +337,10 @@ func TestLoadFallsBackWhenIndexIsUnusable(t *testing.T) {
 		if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 1 {
 			t.Errorf("%s: rows file has %d lines, want 1 (fallback dedupe failed)", name, n)
 		}
-		// The fallback must have healed the index on the way out.
-		if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != 8 {
-			t.Errorf("%s: index not rebuilt (size=%v, err=%v), want 8 bytes", name, fi, err)
+		// The fallback must have healed the index on the way out, in the
+		// current format.
+		if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != idxSize("q", 1) {
+			t.Errorf("%s: index not rebuilt (size=%d, err=%v), want %d", name, sizeOf(fi), err, idxSize("q", 1))
 		}
 	}
 }
@@ -281,7 +361,7 @@ func TestReindexRebuildsFromRowsFiles(t *testing.T) {
 
 	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
 	s2.SetReindex(true)
-	if err := s2.Load(); err != nil {
+	if err := s2.Load(nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := s2.AddRows("q", rows, time.Now()); err != nil {
@@ -290,8 +370,37 @@ func TestReindexRebuildsFromRowsFiles(t *testing.T) {
 	if n := strings.Count(readFile(t, s2.rowsPath), "\n"); n != 1 {
 		t.Errorf("rows file has %d lines, want 1", n)
 	}
-	if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != 8 {
-		t.Errorf("reindex did not rewrite the index (size=%v, err=%v), want 8 bytes", fi, err)
+	if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != idxSize("q", 1) {
+		t.Errorf("reindex did not rewrite the index (size=%d, err=%v), want %d", sizeOf(fi), err, idxSize("q", 1))
+	}
+}
+
+// A rebuild must skip the rows of finished queries: those hashes are never
+// read again, and carrying them is what made the old index a gigabyte.
+func TestReindexSkipsFinishedQueries(t *testing.T) {
+	dir := t.TempDir()
+	rowsPath := filepath.Join(dir, "trademarks.tsv")
+	s1 := NewSink(filepath.Join(dir, "results.txt"), rowsPath, dir, 0, false, false)
+	if err := s1.AddRows("done already", []Row{{Brand: "A", RecordID: "R1", Number: 1}}, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+	if err := s1.AddRows("still open", []Row{{Brand: "B", RecordID: "R2", Number: 1}}, time.Now()); err != nil {
+		t.Fatalf("AddRows: %v", err)
+	}
+
+	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, false, false)
+	s2.SetReindex(true)
+	if err := s2.Load(func(q string) bool { return q == "done already" }); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := s2.seen["done already"]; ok {
+		t.Error("a finished query's rows were kept by the rebuild")
+	}
+	if len(s2.seen["still open"]) != 1 {
+		t.Errorf("the open query holds %d hash(es), want 1", len(s2.seen["still open"]))
+	}
+	if fi, err := os.Stat(s2.idxPath()); err != nil || fi.Size() != idxSize("still open", 1) {
+		t.Errorf("index size = %d (err=%v), want %d", sizeOf(fi), err, idxSize("still open", 1))
 	}
 }
 
@@ -361,7 +470,7 @@ func TestLoadRestoresRowDedupe(t *testing.T) {
 
 	// A fresh sink over the same files, as after a restart.
 	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, true, true)
-	if err := s2.Load(); err != nil {
+	if err := s2.Load(nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := s2.AddRows("the-royal", rows, time.Now()); err != nil {
@@ -437,7 +546,7 @@ func TestLoadReadsRotatedParts(t *testing.T) {
 	// Restart with rotation effectively off, so the new write is observable in
 	// the active file while the parts stay put.
 	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 1<<30, false, false)
-	if err := s2.Load(); err != nil {
+	if err := s2.Load(nil); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := s2.AddRows("q", append(rows, Row{Brand: "NEW", RecordID: "R3", Number: 3}), at); err != nil {
@@ -456,47 +565,59 @@ func TestLoadReadsRotatedParts(t *testing.T) {
 func TestCheckpointSurvivesARestart(t *testing.T) {
 	s1 := newTestSink(t)
 
-	if got := s1.Checkpoint("*", 0, 0); got != 0 {
-		t.Errorf("Checkpoint on a fresh sink = %d, want 0", got)
+	if page, rows := s1.Checkpoint("*", 0, 0); page != 0 || rows != -1 {
+		t.Errorf("Checkpoint on a fresh sink = (%d, %d), want (0, -1)", page, rows)
 	}
-	if err := s1.SetCheckpoint("*", 0, 0, 4821); err != nil {
+	if err := s1.SetCheckpoint("*", 0, 0, 4821, 482100); err != nil {
 		t.Fatalf("SetCheckpoint: %v", err)
+	}
+	if page, rows := s1.Checkpoint("*", 0, 0); page != 4821 || rows != 482100 {
+		t.Errorf("Checkpoint = (%d, %d), want (4821, 482100) — the row total is what the completeness check holds a resumed walk against",
+			page, rows)
 	}
 
 	// Shards keep their own resume points in the same directory: block 2 at
 	// 7000 says nothing about where block 0 stopped.
-	if err := s1.SetCheckpoint("*", 2, 4, 9000); err != nil {
+	if err := s1.SetCheckpoint("*", 2, 4, 9000, 900000); err != nil {
 		t.Fatalf("SetCheckpoint shard: %v", err)
 	}
-	if got := s1.Checkpoint("*", 2, 4); got != 9000 {
-		t.Errorf("Checkpoint(shard 2) = %d, want 9000", got)
+	if page, _ := s1.Checkpoint("*", 2, 4); page != 9000 {
+		t.Errorf("Checkpoint(shard 2) = %d, want 9000", page)
 	}
 
 	// Same directory, new sink — as after the process died and came back.
 	s2 := NewSink(s1.resultsPath, s1.rowsPath, s1.dataDir, 0, true, true)
-	if got := s2.Checkpoint("*", 0, 0); got != 4821 {
-		t.Errorf("Checkpoint after restart = %d, want 4821", got)
+	if page, rows := s2.Checkpoint("*", 0, 0); page != 4821 || rows != 482100 {
+		t.Errorf("Checkpoint after restart = (%d, %d), want (4821, 482100)", page, rows)
 	}
-	if got := s2.Checkpoint("*", 2, 4); got != 9000 {
-		t.Errorf("Checkpoint(shard 2) after restart = %d, want 9000", got)
+	if page, _ := s2.Checkpoint("*", 2, 4); page != 9000 {
+		t.Errorf("Checkpoint(shard 2) after restart = %d, want 9000", page)
 	}
-	if got := s2.Checkpoint("*", 1, 4); got != 0 {
-		t.Errorf("Checkpoint(shard 1, never written) = %d, want 0", got)
+	if page, _ := s2.Checkpoint("*", 1, 4); page != 0 {
+		t.Errorf("Checkpoint(shard 1, never written) = %d, want 0", page)
 	}
 
 	// A torn checkpoint reads as "no checkpoint" rather than as page -1: the
 	// cost of a bad file is a re-walk that dedupe absorbs, never skipped rows.
 	writeFile(t, s2.ckptPath("broken", 0, 0), "not a page")
-	if got := s2.Checkpoint("broken", 0, 0); got != 0 {
-		t.Errorf("Checkpoint of a corrupt file = %d, want 0", got)
+	if page, _ := s2.Checkpoint("broken", 0, 0); page != 0 {
+		t.Errorf("Checkpoint of a corrupt file = %d, want 0", page)
+	}
+
+	// A checkpoint written by an older build carries only the page. It still
+	// resumes — with an unknown row total, which simply skips the completeness
+	// check rather than guessing a number.
+	writeFile(t, s2.ckptPath("legacy", 0, 0), "512\n")
+	if page, rows := s2.Checkpoint("legacy", 0, 0); page != 512 || rows != -1 {
+		t.Errorf("Checkpoint of a page-only file = (%d, %d), want (512, -1)", page, rows)
 	}
 
 	// Finishing the query removes every shard's resume point; a leftover would
 	// send the next run past pages it is supposed to collect.
 	s2.DropCheckpoint("*", 4)
 	for shard := 0; shard < 4; shard++ {
-		if got := s2.Checkpoint("*", shard, 4); got != 0 {
-			t.Errorf("Checkpoint(shard %d) after drop = %d, want 0", shard, got)
+		if page, _ := s2.Checkpoint("*", shard, 4); page != 0 {
+			t.Errorf("Checkpoint(shard %d) after drop = %d, want 0", shard, page)
 		}
 	}
 	s2.DropCheckpoint("broken", 0)

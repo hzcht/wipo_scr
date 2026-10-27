@@ -58,6 +58,13 @@ type Config struct {
 	// (max_attempts reached). Those are retried on the next run, so this file is
 	// a record of what to look at, not a blacklist.
 	FailedFile string `toml:"failed_file"`
+	// ShortFile is the list of queries that reached the end of their results
+	// with a page or more fewer rows than the pager promised: "query <tab>
+	// count <tab> rows <tab> date". Such a query is counted in results.txt but
+	// deliberately left out of DoneFile, so the next run walks it again and
+	// dedupe fills the hole. A second shortfall in a row is accepted (the gap is
+	// in the data, not in the walk) and the line stays here as the marker.
+	ShortFile string `toml:"short_file"`
 
 	// Threads is the number of concurrent browsers. Each one owns a
 	// persistent Chromium profile, so this is also the number of windows on
@@ -222,6 +229,7 @@ func DefaultConfig() Config {
 		SweepSecs:    180,       // reap a leftover window within three minutes
 		DoneFile:     "done.lst",
 		FailedFile:   "failed.lst",
+		ShortFile:    "short.lst",
 
 		Threads:     3,
 		SplitPages:  false,
@@ -298,6 +306,7 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 	sweepSecs := fs.Int64("sweep-secs", 0, "seconds between background sweeps for leftover browser windows (0 = off)")
 	doneFile := fs.String("done-file", "", "file with the queries already collected (makes a run resumable)")
 	failedFile := fs.String("failed-file", "", "file with the queries that ran out of attempts")
+	shortFile := fs.String("short-file", "", "file with the queries whose rows came up short of the count (re-walked next run)")
 	threads := fs.Int("threads", 0, "number of concurrent browsers")
 	splitPages := fs.Bool("split-pages", false, "split every query's pages across the threads (for one huge query)")
 	maxAttempts := fs.Int("max-attempts", 0, "max attempts per query before it goes to failed.lst")
@@ -369,6 +378,8 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 			c.DoneFile = *doneFile
 		case "failed-file":
 			c.FailedFile = *failedFile
+		case "short-file":
+			c.ShortFile = *shortFile
 		case "proxy":
 			c.ProxyList = *proxyList
 		case "profiles-dir":
@@ -456,6 +467,8 @@ func (c *Config) Validate() error {
 		return errors.New("done_file is required")
 	case c.FailedFile == "":
 		return errors.New("failed_file is required")
+	case c.ShortFile == "":
+		return errors.New("short_file is required")
 	case c.Threads < 1:
 		return errors.New("threads must be >= 1")
 	case c.Mode != "replay" && c.Mode != "browser":
@@ -521,7 +534,8 @@ func (c *Config) Log() {
 	log.Printf("config: proxy[tuning fail_budget=%d cooldown=%ds probe=%dms/%d ref=%dms scale=%.1f..%.1f] probe_url=%s",
 		c.ProxyFailBudget, c.ProxyCooldownMS/1000, c.ProxyProbeTimeoutMS, c.ProxyProbeConcurrency,
 		c.ProxyLatencyRefMS, c.TimeoutScaleMin, c.TimeoutScaleMax, c.ProxyProbeURL)
-	log.Printf("config: errors_template=%s pause_all=%ds sweep_secs=%d (0 = off)", c.ErrorsTemplate, c.AllThreadsPauseDuration, c.SweepSecs)
+	log.Printf("config: errors_template=%s pause_all=%ds sweep_secs=%d (0 = off) short=%s",
+		c.ErrorsTemplate, c.AllThreadsPauseDuration, c.SweepSecs, c.ShortFile)
 	log.Printf("config: pages %s..%s of every query%s%s", pageBound(c.StartPage), pageBound(c.EndPage),
 		pageNote(c.StartPage, c.EndPage), splitNote(c.SplitPages, c.Threads))
 }

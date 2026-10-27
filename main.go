@@ -59,9 +59,16 @@ func main() {
 	// rows files and exit. None of the crawl machinery — proxies, playwright,
 	// workers — is involved, so it runs before any of it starts.
 	if cfg.Reindex {
+		// The rebuild keeps only the queries that are still open, so it needs
+		// done.lst — the same file the run itself reads. It is loaded here
+		// because this branch leaves before the run's own stores are built.
+		done, err := queue.LoadStore(cfg.DoneFile)
+		if err != nil {
+			log.Fatalf("%s: %v", cfg.DoneFile, err)
+		}
 		sink := site.NewSink(cfg.ResultsFile, cfg.RowsFile, cfg.DataDir, cfg.RowsMaxBytes, cfg.SaveGrid, cfg.SaveFull)
 		sink.SetReindex(true)
-		if err := sink.Load(); err != nil {
+		if err := sink.Load(done.Has); err != nil {
 			log.Fatalf("reindex: %v", err)
 		}
 		log.Printf("reindex done")
@@ -170,11 +177,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("%s: %v", cfg.FailedFile, err)
 	}
+	// Queries that came up short of their count. They are neither done (the
+	// next run walks them again) nor failed (nothing went wrong with the
+	// attempt) — this file is why the hole in them is visible instead of
+	// quietly permanent.
+	short, err := queue.LoadStore(cfg.ShortFile)
+	if err != nil {
+		log.Fatalf("%s: %v", cfg.ShortFile, err)
+	}
 	if *migrateLegacy {
 		migrateLegacyState(done)
 	}
-	log.Printf("%s: %d queries already collected, %s: %d queries that need another try",
-		cfg.DoneFile, done.Len(), cfg.FailedFile, failed.Len())
+	log.Printf("%s: %d queries already collected, %s: %d queries that need another try, %s: %d queries short of their count",
+		cfg.DoneFile, done.Len(), cfg.FailedFile, failed.Len(), cfg.ShortFile, short.Len())
 
 	tasks, err := queue.BuildTasks(cfg.Input, done)
 	if err != nil {
@@ -197,7 +212,10 @@ func main() {
 
 	// (7) shared dependencies
 	sink := site.NewSink(cfg.ResultsFile, cfg.RowsFile, cfg.DataDir, cfg.RowsMaxBytes, cfg.SaveGrid, cfg.SaveFull)
-	if err := sink.Load(); err != nil {
+	// The dedupe index is loaded with the done filter: a finished query's
+	// hashes can never be asked for again, so neither they nor their memory are
+	// carried into this run.
+	if err := sink.Load(done.Has); err != nil {
 		log.Fatalf("load output files: %v", err)
 	}
 	q := queue.NewQueue(tasks, cfg.Threads, time.Duration(cfg.AllThreadsPauseDuration)*time.Second)
@@ -211,6 +229,7 @@ func main() {
 		Gate:      browser.NewGatePool(time.Duration(cfg.SubmitGapMS)*time.Millisecond, time.Duration(cfg.SubmitJitterMS)*time.Millisecond),
 		Done:      done,
 		Failed:    failed,
+		Short:     short,
 		Sink:      sink,
 		Collected: &atomic.Int64{},
 		Scripts:   Scripts(),

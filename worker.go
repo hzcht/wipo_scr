@@ -40,6 +40,7 @@ type Deps struct {
 	Gate      *browser.GatePool
 	Done      *queue.Store
 	Failed    *queue.Store
+	Short     *queue.Store // queries whose rows came up short of the pager's count
 	Sink      *site.Sink
 	Collected *atomic.Int64
 	Scripts   []string // stealth payloads, embedded in stealth.go
@@ -374,13 +375,18 @@ func (w *worker) handle(t queue.Task) {
 		case res.err == nil && res.action == "":
 			w.deps.Proxy.Success(w.proxy)
 			w.blockRuns = 0
-			terminal, err := w.finishQuery(&t, res.count)
+			outcome, err := w.finishQuery(&t, res.count, res.rows, res.partial)
 			if err != nil {
 				log.Printf("task %q: %v -> requeued", t.Name, err)
 				w.deps.Queue.Requeue(t)
 				return
 			}
-			w.reportDone(&t, terminal, fmt.Sprintf("collected (proxy %q, took %s)", w.proxy, took))
+			// A partial or a short walk logs its own reason inside finishQuery:
+			// printing "collected" over either would be exactly the lie the
+			// check exists to prevent.
+			if outcome == finishCollected || outcome == finishShard {
+				w.reportDone(&t, outcome == finishCollected, fmt.Sprintf("collected (proxy %q, took %s)", w.proxy, took))
+			}
 			w.deps.Queue.Done()
 			return
 
@@ -388,7 +394,7 @@ func (w *worker) handle(t queue.Task) {
 			// A real answer, just an empty one: the count goes in as 0 and the
 			// query is done. The old collector filed these in a separate "lost"
 			// list, which made a finished query look unfinished on the next run.
-			terminal, err := w.finishQuery(&t, 0)
+			outcome, err := w.finishQuery(&t, 0, 0, false)
 			if err != nil {
 				log.Printf("task %q: %v -> requeued", t.Name, err)
 				w.deps.Queue.Requeue(t)
@@ -396,7 +402,7 @@ func (w *worker) handle(t queue.Task) {
 			}
 			w.deps.Proxy.Success(w.proxy)
 			w.blockRuns = 0
-			w.reportDone(&t, terminal, fmt.Sprintf("no trademarks (proxy %q, took %s)", w.proxy, took))
+			w.reportDone(&t, outcome == finishCollected, fmt.Sprintf("no trademarks (proxy %q, took %s)", w.proxy, took))
 			w.deps.Queue.Done()
 			return
 
@@ -553,28 +559,127 @@ func (w *worker) handle(t queue.Task) {
 	}
 }
 
+// finishOutcome says what became of the query as a whole.
+type finishOutcome int
+
+const (
+	// finishCollected: the count is in results.txt and the query is in done.lst.
+	finishCollected finishOutcome = iota
+	// finishShard: one piece of a split query landed; the query is recorded
+	// when its last piece reports in.
+	finishShard
+	// finishPartial: the walk stopped at max_pages, short of the data. The
+	// checkpoint stays so a later run continues from where it stopped, and the
+	// query is in neither done.lst nor failed.lst — it is simply not finished.
+	finishPartial
+	// finishShort: the walk reached the end of the results but wrote a page or
+	// more fewer rows than the position line promised. The count is recorded,
+	// the query is not, and short.lst says by how much: the next run walks it
+	// again and dedupe fills the hole.
+	finishShort
+)
+
 // finishQuery records a query as collected: its count in results.txt, its name
 // in done.lst, its resume point removed.
+//
+// It refuses to do that for two outcomes, because done.lst is permanent and a
+// query in it is never looked at again:
+//
+//   - a partial walk (max_pages) has not seen the end of the data. Its
+//     checkpoint is what a later run continues from, and appending it to
+//     done.lst would end that resume for good.
+//   - a walk that reached the end but wrote fewer rows than the position line
+//     promised has a hole in it: an answer the endpoint returned short, or a
+//     page that came back empty and used to advance the checkpoint anyway. The
+//     gap is measured against rows_per_page — a shortfall smaller than one page
+//     is the handful of repeats the site legitimately serves across a page
+//     boundary, and chasing those forever would cost more than they do.
+//
+// A query that falls short twice in a row is accepted — by then the gap is in
+// the data, not in the walk — and keeps its line in short.lst as the record of
+// what it is missing.
 //
 // A split query passes through the gate first and is only recorded when its
 // last shard reports in — the count file would deduplicate repeated counts, but
 // done.lst would not, and a query marked collected after one quarter of its
-// pages would never be finished on any later run.
-func (w *worker) finishQuery(t *queue.Task, count int) (bool, error) {
+// pages would never be finished on any later run. Its pieces walk a block each,
+// so there is no whole-query row total to hold against the count.
+func (w *worker) finishQuery(t *queue.Task, count, rows int, partial bool) (finishOutcome, error) {
+	if partial {
+		log.Printf("task %q: stopped at max_pages with %s rows of %d — NOT marked collected; the checkpoint stays and a later run continues",
+			t.Name, rowTotalText(rows), count)
+		return finishPartial, nil
+	}
 	if t.Sharded() {
 		last, final := w.deps.Shards.Reach(t.Name, count, t.ShardCount)
 		if !last {
-			return false, nil
+			return finishShard, nil
 		}
 		count = final
+		rows = -1 // each piece owns a block: no total to compare
+	}
+	if short, missing := w.shortOfCount(t, count, rows); short {
+		if w.deps.Short.Has(t.Name) {
+			// Second time around: the shortfall is in the data, not in the walk.
+			// Record it as collected so the run can move on — the line in
+			// short.lst stays as the record of what it never got.
+			log.Printf("task %q: SHORT again — %d promised, %d written — accepting it; the line stays in %s",
+				t.Name, count, rows, w.deps.Cfg.ShortFile)
+		} else {
+			if err := w.deps.Sink.AddCount(t.Name, count, time.Now()); err != nil {
+				return finishCollected, err
+			}
+			w.deps.Short.AppendRecord(t.Name, fmt.Sprintf("%d", count), fmt.Sprintf("%d", rows), site.Day(time.Now()))
+			// The resume point goes with it: a checkpoint sitting at the last
+			// page would send the next run straight past the hole it is here to
+			// fill, while dedupe keeps everything that was already written.
+			w.deps.Sink.DropCheckpoint(t.Name, t.ShardCount)
+			log.Printf("task %q: SHORT — the position line promised %d rows, %d were written (missing %d) — counted, NOT marked collected; recorded in %s and re-walked on the next run",
+				t.Name, count, rows, missing, w.deps.Cfg.ShortFile)
+			return finishShort, nil
+		}
 	}
 	if err := w.deps.Sink.AddCount(t.Name, count, time.Now()); err != nil {
-		return false, err
+		return finishCollected, err
 	}
 	w.deps.Sink.DropCheckpoint(t.Name, t.ShardCount)
 	w.deps.Done.Append(t.Name)
+	// Nothing that can run again needs its hashes: a collected query is never
+	// re-walked, and keeping them is what grew the dedupe index past the memory
+	// of the machine it runs on.
+	w.deps.Sink.Forget(t.Name)
 	w.deps.Collected.Add(1)
-	return true, nil
+	return finishCollected, nil
+}
+
+// shortOfCount reports whether a finished walk is missing at least a whole page
+// of rows against the position line's total, and by how much. rows below zero
+// means the total cannot be reconstructed (a legacy checkpoint, a shard, a
+// bounded range) and nothing is held against anything.
+func (w *worker) shortOfCount(t *queue.Task, count, rows int) (bool, int) {
+	if count < 0 || rows < 0 || !w.fullWalk(t) {
+		return false, 0
+	}
+	missing := count - rows
+	return missing >= w.deps.Cfg.RowsPerPage, missing
+}
+
+// fullWalk reports whether this task was meant to cover every page of its
+// query: not a piece of a split run, not a -start-page/-end-page slice, and not
+// capped by max_pages. Only such a walk can be held against the pager's total.
+func (w *worker) fullWalk(t *queue.Task) bool {
+	return !t.Sharded() &&
+		w.deps.Cfg.StartPage <= 1 && w.deps.Cfg.EndPage <= 0 &&
+		w.deps.Cfg.MaxPages <= 0
+}
+
+// rowTotalText renders a row total for a log line: -1 is "unknown", which is
+// what a checkpoint written by an older build leaves behind.
+func rowTotalText(rows int) string {
+	if rows < 0 {
+		return "an unknown number of"
+	}
+	return fmt.Sprintf("%d", rows)
 }
 
 // reportDone logs a finished task, saying which shard it was when the query is
@@ -594,7 +699,17 @@ type attemptResult struct {
 	action string
 	marker string
 	count  int
-	err    error
+	// rows is how many rows of this query are on disk once the attempt is over:
+	// what the checkpoint said earlier attempts wrote, plus what this one did.
+	// It is -1 when that cannot be known, which skips the completeness check
+	// instead of guessing. count is what the pager promised; rows is what was
+	// actually written, and finishQuery holds the two against each other.
+	rows int
+	// partial says the walk stopped short of the end of the data on purpose —
+	// max_pages — rather than because it reached the last page. A partial walk
+	// is not a collected query: done.lst would end its resume point.
+	partial bool
+	err     error
 }
 
 // attempt runs one search and turns whatever came back into an action, a
@@ -671,12 +786,12 @@ func (w *worker) runAttempt(t *queue.Task) attemptResult {
 		w.saveFullPage(t.Name)
 		return attemptResult{err: errNoResults}
 	}
-	count, err := w.collect(t, res.pager)
+	count, rows, partial, err := w.collect(t, res.pager)
 	if err != nil {
 		w.pageOK = false
 		return attemptResult{err: err}
 	}
-	return attemptResult{count: count}
+	return attemptResult{count: count, rows: rows, partial: partial}
 }
 
 // saveFullPage archives the whole current page when save_full is on. It is a
@@ -767,11 +882,11 @@ func (w *worker) replayAttempt(t *queue.Task) attemptResult {
 	if page.NumFound == 0 {
 		return attemptResult{err: errNoResults}
 	}
-	count, err := w.replayCollect(t, page)
+	count, rows, partial, err := w.replayCollect(t, page)
 	if err != nil {
 		return attemptResult{err: err}
 	}
-	return attemptResult{count: count}
+	return attemptResult{count: count, rows: rows, partial: partial}
 }
 
 // replaySearch fetches one page of rows at a row offset. The round trip is
@@ -797,13 +912,30 @@ func (w *worker) replaySearch(query string, start, rows int) (*replay.Page, erro
 // rows, with the pager derived from the Solr numbers instead of read off the
 // DOM. Each page's raw JSON lands in the archive the grid HTML would have
 // taken — it is the source the TSV rows were parsed from, nothing less.
-func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
+//
+// It returns the count the endpoint reports, how many rows of this query are on
+// disk once the attempt is counted (including what earlier attempts wrote, -1
+// when that cannot be known), whether the walk stopped short of the data on
+// purpose (max_pages), and an error for anything that must not be recorded.
+//
+// Every page is held to a contract before its rows are written and before the
+// checkpoint moves: it has to be the page that was asked for, at the offset it
+// was asked for, and it has to hold rows. Nothing here advances the resume
+// point on faith. The hole this replaced was exactly one page per violation —
+// an empty or clamped answer moved the checkpoint just as happily as a full
+// one, while results.txt went on claiming rows that were never written.
+func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, int, bool, error) {
 	pageSize := w.deps.Cfg.RowsPerPage
 	if pageSize <= 0 {
 		pageSize = 100
 	}
 	count := first.NumFound
 	page := first
+
+	// The resume point comes first: it carries where to start *and* how many
+	// rows this query already has, which is the row total the completeness check
+	// needs even when this attempt turns out to collect nothing.
+	resume, haveRows := w.deps.Sink.Checkpoint(t.Name, t.Shard, t.ShardCount)
 
 	from, to := 1, 0 // open range: the first page to the last
 	if t.Sharded() {
@@ -812,7 +944,7 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 		if !ok {
 			log.Printf("task %q shard %d/%d: past the last page of %d rows, nothing to collect",
 				t.Name, t.Shard+1, t.ShardCount, count)
-			return count, nil
+			return count, haveRows, false, nil
 		}
 	}
 	if s := w.deps.Cfg.StartPage; s > from {
@@ -821,19 +953,18 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 	if e := w.deps.Cfg.EndPage; e > 0 && (to == 0 || e < to) {
 		to = e
 	}
-	resume := w.deps.Sink.Checkpoint(t.Name, t.Shard, t.ShardCount)
 	if resume >= from {
 		if to > 0 && resume >= to {
 			log.Printf("task %q: checkpoint page %d already covers %d..%d, nothing to collect",
 				t.Name, resume, from, to)
-			return count, nil
+			return count, haveRows, false, nil
 		}
 		from = resume + 1
 	}
 	if last := lastGridPage(count, pageSize); from > last {
 		log.Printf("task %q: starting at page %d, past the last page %d of %d rows, nothing to collect",
 			t.Name, from, last, count)
-		return count, nil
+		return count, haveRows, false, nil
 	}
 	if from > 1 {
 		log.Printf("task %q: starting at page %d (range %d..%s, %d rows known)",
@@ -846,18 +977,46 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 	seen := map[string]struct{}{}
 	firstPage := 0
 	lastPage := 0
+	partial := false
+	// totalRows is what has reached rows.tsv for this query once this attempt is
+	// counted: what the checkpoint says earlier attempts wrote, plus what is
+	// being written now. Unknown (-1) stays unknown rather than guessed.
+	totalRows := func() int {
+		if haveRows < 0 {
+			return -1
+		}
+		return haveRows + len(seen)
+	}
 
 	for gridPage := from; ; gridPage++ {
 		// The search already returned page 1; a shard or a resume starts
 		// further in and fetches the offset it actually owns.
-		if page == nil || page.Start != (gridPage-1)*pageSize {
+		wantStart := (gridPage - 1) * pageSize
+		if page == nil || page.Start != wantStart {
 			w.at(fmt.Sprintf("replay page %d", gridPage))
 			var err error
-			if page, err = w.replaySearch(t.Name, (gridPage-1)*pageSize, pageSize); err != nil {
-				return count, err
+			if page, err = w.replaySearch(t.Name, wantStart, pageSize); err != nil {
+				return count, -1, false, err
 			}
 		}
+		// The contract with the endpoint, checked before anything is written.
+		if page.Start != wantStart {
+			return count, -1, false, fmt.Errorf("grid page %d: the endpoint answered offset %d, want %d",
+				gridPage, page.Start, wantStart)
+		}
 		count = page.NumFound
+		last := lastGridPage(count, pageSize)
+		if len(page.Rows) == 0 {
+			return count, -1, false, fmt.Errorf("grid page %d: no rows at offset %d (numFound=%d)",
+				gridPage, page.Start, count)
+		}
+		if gridPage < last && len(page.Rows) != pageSize {
+			// The endpoint changed the page size. The offsets below are computed
+			// from pageSize, so walking on would step over the rows in between —
+			// silently, a whole page at a time. Refuse instead.
+			return count, -1, false, fmt.Errorf("grid page %d: %d rows, want %d — the endpoint changed the page size",
+				gridPage, len(page.Rows), pageSize)
+		}
 		if firstPage == 0 {
 			firstPage = gridPage
 		}
@@ -877,7 +1036,7 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 			fresh = append(fresh, r)
 		}
 		if err := w.deps.Sink.AddRows(t.Name, fresh, collectedAt); err != nil {
-			return count, err
+			return count, -1, false, err
 		}
 		pages++
 		lastPage = gridPage
@@ -886,12 +1045,12 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 		w.at(fmt.Sprintf("replay page %d", gridPage))
 		// Written after the rows, never before: a checkpoint that ran ahead of
 		// the data would send the resume past rows that were never written.
-		if err := w.deps.Sink.SetCheckpoint(t.Name, t.Shard, t.ShardCount, gridPage); err != nil {
+		if err := w.deps.Sink.SetCheckpoint(t.Name, t.Shard, t.ShardCount, gridPage, totalRows()); err != nil {
 			log.Printf("task %q: checkpoint page %d: %v (a restart would re-walk from the block start)",
 				t.Name, gridPage, err)
 		}
 
-		if gridPage >= lastGridPage(count, pageSize) {
+		if gridPage >= last {
 			break
 		}
 		// max_pages applies per shard: each shard walks up to MaxPages pages
@@ -899,6 +1058,7 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 		if max := w.deps.Cfg.MaxPages; max > 0 && pages >= max {
 			log.Printf("task %q: max_pages=%d reached, %d of %d rows collected",
 				t.Name, max, len(seen), count)
+			partial = true
 			break
 		}
 		if to > 0 && gridPage >= to {
@@ -915,7 +1075,7 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, error) {
 	}
 	log.Printf("task %q: %d trademarks, %d rows over %d page(s) (grid pages %d-%d) in %s",
 		t.Name, count, len(seen), pages, firstPage, lastPage, time.Since(start).Round(time.Millisecond))
-	return count, nil
+	return count, totalRows(), partial, nil
 }
 
 // lastGridPage is the grid page number the last row sits on, and at least 1:
@@ -986,9 +1146,12 @@ func pageBlock(totalRows, pageSize, workers, workerID int) (from, to int, ok boo
 // interrupted crawl restart at page 1 and re-walk thousands of pages it has
 // already written; missing the block boundaries is what makes a split run
 // either skip rows or collect them four times.
-func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
+// It returns the same four things replayCollect does — count, rows on disk,
+// partial, error — and holds every page to the same contract: a page that does
+// not carry what the position line promises is an error, never a shorter walk.
+func (w *worker) collect(t *queue.Task, pagerText string) (int, int, bool, error) {
 	if err := w.setRowsPerPage(); err != nil {
-		return 0, err
+		return 0, -1, false, err
 	}
 	// Switching the page size reloads the grid, so the position line that came
 	// with the results page is stale by now — "1 - 10 / 955" while the grid
@@ -1002,7 +1165,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 
 	shape, err := site.ParsePager(pagerText)
 	if err != nil {
-		return 0, fmt.Errorf("pager: %w", err)
+		return 0, -1, false, fmt.Errorf("pager: %w", err)
 	}
 	count := shape.Total
 
@@ -1022,6 +1185,12 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 			t.Name, pageSize, w.deps.Cfg.RowsPerPage)
 	}
 
+	// The resume point is read before the block is worked out, because it also
+	// carries how many rows this query already has: the total the completeness
+	// check holds the finished walk against, and the only number that survives a
+	// run that turns out to collect nothing.
+	resume, haveRows := w.deps.Sink.Checkpoint(t.Name, t.Shard, t.ShardCount)
+
 	from, to := 1, 0 // open range: the site's first page to its last
 	if t.Sharded() {
 		if freshErr != nil {
@@ -1029,7 +1198,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 			// using now; the stale line from before the resize would draw the
 			// blocks wrong, and a wrong boundary skips rows rather than merely
 			// re-collecting them. Requeue instead of guessing.
-			return count, fmt.Errorf("shard %d/%d needs a fresh position line after the page-size change: %w",
+			return count, -1, false, fmt.Errorf("shard %d/%d needs a fresh position line after the page-size change: %w",
 				t.Shard+1, t.ShardCount, freshErr)
 		}
 		var ok bool
@@ -1037,7 +1206,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 		if !ok {
 			log.Printf("task %q shard %d/%d: past the last page of %d rows, nothing to collect",
 				t.Name, t.Shard+1, t.ShardCount, shape.Total)
-			return count, nil
+			return count, haveRows, false, nil
 		}
 	}
 	if s := w.deps.Cfg.StartPage; s > from {
@@ -1050,12 +1219,11 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 	// Resume: the checkpoint page was written to rows.tsv, so collecting starts
 	// after it. The checkpoint is per query and shard, and it never points past
 	// the data — a lost checkpoint only costs a re-walk that dedupe absorbs.
-	resume := w.deps.Sink.Checkpoint(t.Name, t.Shard, t.ShardCount)
 	if resume >= from {
 		if to > 0 && resume >= to {
 			log.Printf("task %q: checkpoint page %d already covers %d..%d, nothing to collect",
 				t.Name, resume, from, to)
-			return count, nil
+			return count, haveRows, false, nil
 		}
 		from = resume + 1
 	}
@@ -1066,7 +1234,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 	if from > 1 {
 		jumped, err := w.gotoPage(from, pagerText)
 		if err != nil {
-			return count, fmt.Errorf("start at page %d: %w", from, err)
+			return count, -1, false, fmt.Errorf("start at page %d: %w", from, err)
 		}
 		log.Printf("task %q: starting at page %d (range %d..%s, %d rows known, %s)",
 			t.Name, from, from, pageBoundText(to), count, jumped)
@@ -1079,6 +1247,16 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 	seen := map[string]struct{}{}
 	firstPage := 0
 	lastPage := 0
+	partial := false
+	// totalRows is what has reached rows.tsv for this query once this attempt is
+	// counted: what the checkpoint says earlier attempts wrote, plus what is
+	// being written now. Unknown (-1) stays unknown rather than guessed.
+	totalRows := func() int {
+		if haveRows < 0 {
+			return -1
+		}
+		return haveRows + len(seen)
+	}
 	// pageStart times the current page's network step, so a page that took a
 	// long time is a measured latency rather than an unattributed stall.
 	pageStart := time.Now()
@@ -1086,7 +1264,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 	for {
 		p, err := site.ParsePager(pagerText)
 		if err != nil {
-			return count, err
+			return count, -1, false, err
 		}
 		// The grid page number. It is what the range end is compared against and
 		// what the saved grid file is named after, so a shard's files line up
@@ -1103,7 +1281,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 			Timeout: playwright.Float(15000),
 		})
 		if err != nil {
-			return count, fmt.Errorf("read grid: %w", err)
+			return count, -1, false, fmt.Errorf("read grid: %w", err)
 		}
 		// The raw grid is an archive, not the data — rows.tsv is. A full disk
 		// or a locked file must not take the attempt down with it and burn
@@ -1114,7 +1292,22 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 
 		rows, err := site.ParseGrid(grid)
 		if err != nil {
-			return count, err
+			return count, -1, false, err
+		}
+		// The contract with the grid: the position line says how many rows this
+		// page holds, so a page that parses into none of them is a grid that
+		// never finished loading — not a page of zero results. Walking on would
+		// record a hole the size of a page. A page that parses into *some* fewer
+		// rows only gets logged: the parser drops a record with neither a brand
+		// nor an id, and that is a data question rather than a transport one.
+		want := p.To - p.From + 1
+		if want > 0 && len(rows) == 0 {
+			return count, -1, false, fmt.Errorf("grid page %d: the position line promises %d rows, the grid parsed none",
+				gridPage, want)
+		}
+		if want > 0 && len(rows) < want && !p.Last() {
+			log.Printf("task %q: grid page %d parsed %d of the %d rows the position line promises",
+				t.Name, gridPage, len(rows), want)
 		}
 		fresh := make([]site.Row, 0, len(rows))
 		for _, r := range rows {
@@ -1125,7 +1318,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 			fresh = append(fresh, r)
 		}
 		if err := w.deps.Sink.AddRows(t.Name, fresh, collectedAt); err != nil {
-			return count, err
+			return count, -1, false, err
 		}
 		pages++
 		lastPage = gridPage
@@ -1137,7 +1330,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 		w.deps.Proxy.NoteLatency(w.proxy, time.Since(pageStart))
 		// Written after the rows, never before: a checkpoint that ran ahead of
 		// the data would send the resume past rows that were never written.
-		if err := w.deps.Sink.SetCheckpoint(t.Name, t.Shard, t.ShardCount, gridPage); err != nil {
+		if err := w.deps.Sink.SetCheckpoint(t.Name, t.Shard, t.ShardCount, gridPage, totalRows()); err != nil {
 			log.Printf("task %q: checkpoint page %d: %v (a restart would re-walk from the block start)",
 				t.Name, gridPage, err)
 		}
@@ -1148,6 +1341,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 		if max := w.deps.Cfg.MaxPages; max > 0 && pages >= max {
 			log.Printf("task %q: max_pages=%d reached, %d of %d rows collected",
 				t.Name, max, len(seen), p.Total)
+			partial = true
 			break
 		}
 		// A range end — a process shard's -end-page or a split block's last
@@ -1163,7 +1357,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 		pageStart = time.Now()
 		pagerText, err = w.nextPage(pagerText)
 		if err != nil {
-			return count, err
+			return count, -1, false, err
 		}
 	}
 
@@ -1182,7 +1376,7 @@ func (w *worker) collect(t *queue.Task, pagerText string) (int, error) {
 
 	log.Printf("task %q: %d trademarks, %d rows over %d page(s) (grid pages %d-%d) in %s",
 		t.Name, count, len(seen), pages, firstPage, lastPage, time.Since(start).Round(time.Millisecond))
-	return count, nil
+	return count, totalRows(), partial, nil
 }
 
 // pageBoundText renders a range end for a log line: 0 means the site's own

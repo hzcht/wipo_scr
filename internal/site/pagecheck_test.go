@@ -237,6 +237,25 @@ func TestIsForbidden(t *testing.T) {
 	}
 }
 
+// The two words this check looks for live in the result data itself — a mark
+// named "403 FORBIDDEN", a holder named "FORBIDDEN CITY ..." — so a JSON payload
+// is never a refusal, and in plain text the halves only count when they stand
+// next to each other.
+func TestIsForbiddenNeverMatchesResultData(t *testing.T) {
+	payload := `{"response":{"docs":[{"BRAND":["403 FORBIDDEN"]},{"HOL":["FORBIDDEN CITY CULTURE DEVELOPMENT"]}]}}`
+	if IsForbidden(payload) {
+		t.Error("a result payload was read as a 403 refusal")
+	}
+	if IsForbidden("record 403 was blocked because the holder is forbidden to use it") {
+		t.Error("403 and forbidden appearing apart in one document was read as a refusal")
+	}
+	for _, refusal := range []string{"403 Forbidden", "403: Forbidden", "Error 403 - FORBIDDEN"} {
+		if !IsForbidden(refusal) {
+			t.Errorf("%q was not recognised as a refusal", refusal)
+		}
+	}
+}
+
 func TestTrimSnippetNormalisesSpaces(t *testing.T) {
 	got := TrimSnippet("1\u00a0-\u00a0100\u2009/\u2009955 and some more text after it", 12)
 	want := "1 - 100 /..."
