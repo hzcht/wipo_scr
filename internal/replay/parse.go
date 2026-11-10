@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"unicode/utf16"
+	"unicode/utf8"
 
 	"wipos/internal/site"
 )
@@ -233,12 +233,28 @@ func pick(arr []string, last bool) string {
 // stripHTML is jqGrid's stripHtml: drop tags, then swap every double quote
 // for a single quote. That swap is why the ground truth spells
 // GRAND'MÈRE with an apostrophe where the index stores a double quote.
+//
+// Most cell values carry neither a tag nor a quote, so the regexp and the
+// replacement are only run when a byte scan says they can match. The result is
+// byte-identical; a page of 100 documents just stops paying for a regexp
+// engine on every title that has nothing to strip.
 func stripHTML(v string) string {
-	v = tagRe.ReplaceAllString(v, "")
-	if v == "" || v == "&nbsp;" || v == "&#160;" {
+	if v == "" {
 		return ""
 	}
-	return strings.ReplaceAll(v, `"`, `'`)
+	if strings.IndexByte(v, '<') >= 0 {
+		v = tagRe.ReplaceAllString(v, "")
+		if v == "" {
+			return ""
+		}
+	}
+	if v == "&nbsp;" || v == "&#160;" {
+		return ""
+	}
+	if strings.IndexByte(v, '"') >= 0 {
+		return strings.ReplaceAll(v, `"`, `'`)
+	}
+	return v
 }
 
 // tagRe is the bundle's /<("[^"]*"|'[^']*'|[^'">])*>/gi.
@@ -313,15 +329,45 @@ func viennaClass(vcs, usc []string) string {
 	return uniqueJoin(out, ", ")
 }
 
-// clip is JS substring(0, n): a short string comes back whole.
+// clip is JS substring(0, n): a short string comes back whole. The scan is
+// allocation-free; the old version encoded the whole string to UTF-16 just to
+// ask whether it was short enough. A cut through a surrogate pair is not
+// representable in a Go string, so it lands on the rune boundary — these codes
+// are ASCII, and the behaviour for everything else is unchanged up to a
+// half-surrogate that could never be rendered correctly anyway.
 func clip(s string, n int) string {
-	units := utf16.Encode([]rune(s))
-	if len(units) <= n {
-		return s
+	if n <= 0 {
+		return ""
 	}
-	return string(utf16.Decode(units[:n]))
+	units := 0
+	for i, r := range s {
+		width := 1
+		if r > 0xFFFF {
+			width = 2
+		}
+		if units+width > n {
+			return s[:i]
+		}
+		units += width
+		if units == n {
+			return s[:i+utf8.RuneLen(r)]
+		}
+	}
+	return s
 }
 
+// utf16Len is the JS string length: one unit per BMP rune, two outside it.
+// Counting beats encoding: this runs on a length check for every holder, nice
+// class and brand on the page, and the old version allocated a UTF-16 copy of
+// each value just to measure it.
 func utf16Len(s string) int {
-	return len(utf16.Encode([]rune(s)))
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
 }

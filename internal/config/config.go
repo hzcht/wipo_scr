@@ -128,6 +128,14 @@ type Config struct {
 	RowsPerPage int `toml:"rows_per_page"`
 	// MaxPages caps how many result pages one query walks. 0 = every page.
 	MaxPages int `toml:"max_pages"`
+	// PrefetchPages is how many result pages a replay worker keeps in flight
+	// ahead of the page being written. 0 fetches every page just in time.
+	// The round trip, not the disk write, is what a page walk spends its time
+	// on, so a window of 2 halves the wall clock of a large query; a larger
+	// window overlaps more round trips at the cost of more concurrent
+	// requests from the same IP. Browser mode ignores it: there the page is
+	// already rendered by the time collect sees it.
+	PrefetchPages int `toml:"prefetch_pages"`
 
 	// StartPage / EndPage bound which result pages one query walks, in grid
 	// page numbers. 0 on either side means "open" — the default pair walks the
@@ -250,8 +258,11 @@ func DefaultConfig() Config {
 
 		RowsPerPage: 100,
 		MaxPages:    0,
-		StartPage:   0,
-		EndPage:     0,
+		// Two pages in flight is the conservative default: it overlaps the
+		// round trips without doubling the request rate from one IP.
+		PrefetchPages: 2,
+		StartPage:     0,
+		EndPage:       0,
 
 		SubmitGapMS:       3000,
 		SubmitJitterMS:    2500,
@@ -320,6 +331,7 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 	savePDF := fs.Bool("save-pdf", false, "print the first results page to PDF (headless only)")
 	rowsPerPage := fs.Int("rows-per-page", 0, "grid page size: 10, 30, 60 or 100")
 	maxPages := fs.Int("max-pages", 0, "max result pages per query (0 = all)")
+	prefetchPages := fs.Int("prefetch-pages", 0, "replay: result pages fetched ahead of the writer (0 = just in time)")
 	startPage := fs.Int("start-page", 0, "first result page to collect (0 = 1), for splitting a crawl across processes")
 	endPage := fs.Int("end-page", 0, "last result page to collect (0 = the site's own last page)")
 	submitGap := fs.Int("submit-gap", 0, "minimum ms between two search submits from the same IP")
@@ -400,6 +412,8 @@ func (c *Config) ParseFlags(fs *flag.FlagSet) {
 			c.RowsPerPage = *rowsPerPage
 		case "max-pages":
 			c.MaxPages = *maxPages
+		case "prefetch-pages":
+			c.PrefetchPages = *prefetchPages
 		case "start-page":
 			c.StartPage = *startPage
 		case "end-page":
@@ -479,6 +493,8 @@ func (c *Config) Validate() error {
 		return errors.New("rows_per_page must be one of 10, 30, 60, 100 (the sizes the site offers)")
 	case c.MaxPages < 0:
 		return errors.New("max_pages must be >= 0 (0 = every page)")
+	case c.PrefetchPages < 0:
+		return errors.New("prefetch_pages must be >= 0 (0 = fetch every page just in time)")
 	case c.StartPage < 0:
 		return errors.New("start_page must be >= 0 (0 = the first page)")
 	case c.EndPage < 0:
@@ -528,8 +544,8 @@ func (c *Config) Log() {
 		c.Input, c.DataDir, c.ResultsFile, c.RowsFile, bytesOrOff(c.RowsMaxBytes), c.Mode, c.Threads, c.MaxAttempts)
 	log.Printf("config: proxy_list=%s profiles=%s headless=%v save[grid=%v full=%v pdf=%v]",
 		c.ProxyList, c.ProfilesDir, c.Headless, c.SaveGrid, c.SaveFull, c.SavePDF)
-	log.Printf("config: rows_per_page=%d max_pages=%d submit_gap=%dms(+%d) task_pause=%dms(+%d) timeouts[nav=%dms results=%dms watchdog=%s]",
-		c.RowsPerPage, c.MaxPages, c.SubmitGapMS, c.SubmitJitterMS,
+	log.Printf("config: rows_per_page=%d max_pages=%d prefetch_pages=%d submit_gap=%dms(+%d) task_pause=%dms(+%d) timeouts[nav=%dms results=%dms watchdog=%s]",
+		c.RowsPerPage, c.MaxPages, c.PrefetchPages, c.SubmitGapMS, c.SubmitJitterMS,
 		c.TaskPauseMS, c.TaskPauseJitterMS, c.NavTimeoutMS, c.ResultsTimeoutMS, c.Watchdog().Round(time.Millisecond))
 	log.Printf("config: proxy[tuning fail_budget=%d cooldown=%ds probe=%dms/%d ref=%dms scale=%.1f..%.1f] probe_url=%s",
 		c.ProxyFailBudget, c.ProxyCooldownMS/1000, c.ProxyProbeTimeoutMS, c.ProxyProbeConcurrency,

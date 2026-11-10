@@ -105,14 +105,12 @@ type Pool struct {
 // forget quickly, but not so fast that one slow packet doubles every budget.
 const ewmaAlpha = 0.3
 
-// New builds a pool over raw proxy strings. An empty list means direct
-// connections (Pick returns "").
-//
-// Duplicates are dropped, order is kept. A scraped list usually repeats its
-// working entries several times over, and leaving them in means the precheck
-// probes the same endpoint over and over and the rotation keeps handing out the
-// same handful of proxies.
-func New(proxies []string, opts Options) *Pool {
+// Unique trims every entry, drops blanks and repeats, and keeps the order of
+// first appearance. Both the precheck and the pool use it, so the log, the
+// probes and the rotation all describe the same endpoint set: a scraped list
+// that repeats its three working entries thirty times is three probes, not
+// thirty, and a duplicate is not a sixth attempt at the same dead proxy.
+func Unique(proxies []string) []string {
 	seen := make(map[string]struct{}, len(proxies))
 	unique := make([]string, 0, len(proxies))
 	for _, px := range proxies {
@@ -126,6 +124,18 @@ func New(proxies []string, opts Options) *Pool {
 		seen[px] = struct{}{}
 		unique = append(unique, px)
 	}
+	return unique
+}
+
+// New builds a pool over raw proxy strings. An empty list means direct
+// connections (Pick returns "").
+//
+// Duplicates are dropped, order is kept. A scraped list usually repeats its
+// working entries several times over, and leaving them in means the precheck
+// probes the same endpoint over and over and the rotation keeps handing out the
+// same handful of proxies.
+func New(proxies []string, opts Options) *Pool {
+	unique := Unique(proxies)
 	return &Pool{
 		opts:          opts.normalised(),
 		proxies:       unique,

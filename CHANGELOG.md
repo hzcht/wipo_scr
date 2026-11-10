@@ -3,6 +3,75 @@
 All notable changes to the Wisconsin IP collector are listed here, newest first.
 Each entry points at the commit that carried it.
 
+## 2026-11-10 — the replay page walk stops waiting for itself
+
+### Pages are fetched ahead of the writer
+A replay walk was strictly one round trip at a time: ask for a page, write its
+rows, move the checkpoint, ask for the next. Over a proxy a page costs 0.6–3 s
+while the write behind it costs a few milliseconds, so a 1,000-page query spent
+almost all of its life waiting on the wire. This run's logs show exactly that
+shape: page transitions seconds apart, with the disk idle in between.
+
+- `prefetch_pages` (`-prefetch-pages`, default **2**, `0` = old behaviour) keeps
+  that many result pages in flight ahead of the page being written. A large
+  query overlaps its round trips instead of queueing them; browser mode ignores
+  the setting, because its page is already rendered by the time collect sees it.
+- the pipeline is ordered, not racy: rows and checkpoints still move strictly in
+  grid order, an early answer waits in `pending`, and an error is delivered at
+  *its* page — the worker grades and rotates the proxy exactly where the
+  sequential walk would have failed.
+- the window is bounded by the last page the writer **consumed**, not by the
+  last page fetched. A writer stuck on one slow page cannot let the producer
+  race through the query, and the requests stay at the configured aggressiveness.
+- `Close` cancels the in-flight requests and waits for every fetcher to leave the
+  HTTP client before the worker may rotate the proxy or drop the session.
+- a prefetched page outside the planned range (the site's count can grow during
+  a walk) is fetched directly, so a changing `numFound` cannot stall the walk.
+
+### The transport keeps connections warm during that overlap
+Go's default of two idle connections per host was sized for a sequential client:
+the third concurrent page would close its connection after the answer, and the
+next one paid a fresh TLS handshake through the proxy — the most expensive part
+of the round trip. The replay transport now keeps 16 idle connections per host
+and drops the old endpoint's idle pool when the proxy rotates.
+
+### Concurrent failures renew the session once, not once per page
+`Search` already refreshed the session once after a transport failure. With
+several pages in flight, an endpoint death made every one of them fetch the home
+page and race a new JSESSIONID over the others. Renewal is now serialized and
+tagged with a session generation: the first failure after an epoch renews, the
+rest reuse the fresh jar.
+
+### The proxy list is deduplicated before the health check
+`proxy.Unique` is now the single set builder for both the precheck and the pool.
+The current `proxy.lst` has 38 lines and 3 real endpoints: the run used to probe
+the same three addresses 38 times and report a list it was not actually using.
+Matching endpoints are dropped before the probe, and the startup log says how
+many.
+
+### Parser fast paths (small, output-identical)
+- `stripHTML` scans for `<` and `"` before running the tag regexp or the quote
+  replacement; most cell values contain neither.
+- `utf16Len` counts UTF-16 units instead of encoding the string, and `clip`
+  walks runes instead of allocating a UTF-16 copy. Both run on every holder,
+  nice class and brand on a page.
+
+### A rotation in replay drops the browser instead of restarting it
+The ErrNotJSON fallback opens a browser on demand, and that browser used to stay
+open for the rest of the run. Every later 403 then went through `launch()`,
+which closed and relaunched Chromium — **343 relaunches in the 10.5 h run these
+numbers come from**, about 384 s of restart, plus a headed Chromium resident the
+whole time for 17 fallbacks. Replay now closes the browser on rotation and keeps
+none open; a later fallback opens a fresh one on the endpoint the rotation
+picked. Browser mode is unchanged: there the profile and its cookies are the
+thing being moved.
+
+A burnt endpoint also used to relaunch to wipe a profile that replay does not
+have — the fingerprint only supplies the user agent — so `onBlockHit` now just
+drops the session and the endpoint. `Client.Close` releases the abandoned
+session's idle connections at that moment, rather than leaving live tunnels to a
+cooled-down endpoint parked for the transport's idle timeout.
+
 ## 2026-10-26 — data integrity and the memory behind it
 
 ### A 403 is read from the status line, never from the body

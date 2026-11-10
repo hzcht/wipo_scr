@@ -10,6 +10,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"wipos/internal/site"
@@ -35,17 +37,42 @@ var ErrBlocked = errors.New("replay: the request was forbidden (403)")
 // agent, and the select.jsp round trip. Sessions are cheap — one GET of the
 // home page — and each worker owns exactly one, the way each browser profile
 // owns its own cookies.
+//
+// A client is safe for concurrent use. That is what lets a page walk keep
+// several result pages in flight: http.Client and its cookie jar are built for
+// it, and the per-request deadline is atomic because the prefetching walk
+// updates it as the endpoint's measured latency changes.
 type Client struct {
 	hc      *http.Client
 	ua      string
-	Timeout time.Duration
+	timeout atomic.Int64
+
+	// sessMu serializes session renewal. Prefetched pages can fail together
+	// when an endpoint goes away; without this every one of them would fetch
+	// the home page and race a fresh JSESSIONID over the session the others
+	// are about to retry on. sessGen is the epoch a request saw before its
+	// first attempt: a retry only renews if nobody else already did.
+	sessMu  sync.Mutex
+	sessGen uint64
+}
+
+// SetTimeout updates the per-request deadline. It may be called while requests
+// are in flight; each request reads the value when it starts.
+func (c *Client) SetTimeout(d time.Duration) {
+	c.timeout.Store(int64(d))
+}
+
+// Timeout returns the current per-request deadline.
+func (c *Client) Timeout() time.Duration {
+	return time.Duration(c.timeout.Load())
 }
 
 // NewClient builds a session client. The transport mirrors the browser's
 // known-good path: environment proxy (empty means direct/VPN) and no HTTP/2,
-// which the chromium launcher also disables. The client's Timeout field is
-// kept at 0; per-request deadlines are enforced via context.WithTimeout in
-// doRequest so they can be adjusted per attempt without recreating the transport.
+// which the chromium launcher also disables. The client's http.Client.Timeout
+// stays at 0; per-request deadlines are enforced via context.WithTimeout in
+// doRequest so they can be adjusted per attempt without recreating the
+// transport.
 func NewClient(ua string) *Client {
 	jar, _ := cookiejar.New(&cookiejar.Options{})
 	return &Client{
@@ -63,11 +90,33 @@ func NewClient(ua string) *Client {
 // certificates are self-signed, and Go uses one TLS config for both the tunnel
 // and the site behind it. The precheck makes the same call, so an endpoint that
 // passes it is not then rejected here.
+//
+// The idle pool is sized for a prefetching walk. Go's default of two idle
+// connections per host makes every request past the second throw its
+// connection away after the answer, and the next page then pays a fresh TLS
+// handshake through the proxy — the most expensive part of the round trip.
 func newTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	return &http.Transport{
-		Proxy:             proxy,
-		ForceAttemptHTTP2: false,
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		Proxy:               proxy,
+		ForceAttemptHTTP2:   false,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	}
+}
+
+// Close releases the connections the session is holding. A dropped session is
+// never used again — the next attempt builds a new one — but its transport
+// parks idle sockets for IdleConnTimeout, and through a proxy a parked socket
+// is a live tunnel to an endpoint the pool may already have cooled down. Drop
+// those at the moment the session is abandoned rather than 90 s later.
+func (c *Client) Close() {
+	if c == nil {
+		return
+	}
+	if tr, ok := c.hc.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
 	}
 }
 
@@ -86,6 +135,12 @@ func (c *Client) SetProxy(raw string) error {
 		}
 		proxy = http.ProxyURL(u)
 	}
+	// Drop the idle connections of the old endpoint before replacing its
+	// transport. A rotation changes the route, so those connections can never
+	// be reused; leaving them parked held sockets open for minutes.
+	if tr, ok := c.hc.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
 	c.hc.Transport = newTransport(proxy)
 	return nil
 }
@@ -99,7 +154,7 @@ func (c *Client) SetProxy(raw string) error {
 // body of a *successful* answer is the result documents themselves, and those
 // documents legitimately contain anything at all.
 func (c *Client) doRequest(req *http.Request) ([]byte, int, error) {
-	ctx, cancel := context.WithTimeout(req.Context(), c.Timeout)
+	ctx, cancel := context.WithTimeout(req.Context(), c.Timeout())
 	defer cancel()
 	req = req.WithContext(ctx)
 	resp, err := c.hc.Do(req)
@@ -154,7 +209,22 @@ func gradeResponse(status int, raw []byte) ([]byte, error) {
 // EnsureSession fetches the home page once so the jar holds a JSESSIONID.
 // Calling it again rotates the session — used after a failed request.
 func (c *Client) EnsureSession() error {
-	req, err := http.NewRequest("GET", site.HomeURL, nil)
+	return c.EnsureSessionContext(context.Background())
+}
+
+// EnsureSessionContext is EnsureSession with a caller-owned context, so a
+// stopping page walk can abandon the handshake instead of waiting out its
+// whole deadline.
+func (c *Client) EnsureSessionContext(ctx context.Context) error {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.ensureSessionLocked(ctx)
+}
+
+// ensureSessionLocked performs the home-page fetch. The caller holds sessMu, so
+// two prefetched requests cannot rotate the session at the same time.
+func (c *Client) ensureSessionLocked(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", site.HomeURL, nil)
 	if err != nil {
 		return err
 	}
@@ -167,7 +237,29 @@ func (c *Client) EnsureSession() error {
 	if status != http.StatusOK {
 		return fmt.Errorf("replay: session: HTTP %d (%d bytes)", status, len(raw))
 	}
+	c.sessGen++
 	return nil
+}
+
+// sessionGeneration records which session a request is about to use. A retry
+// holds the epoch from before its first attempt.
+func (c *Client) sessionGeneration() uint64 {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.sessGen
+}
+
+// renewSession replaces the session unless another in-flight request already
+// did so since seen was read. In that case the retry can simply use the jar's
+// current cookie: the session is fresh even though this request did not fetch
+// it.
+func (c *Client) renewSession(ctx context.Context, seen uint64) error {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	if c.sessGen != seen {
+		return nil
+	}
+	return c.ensureSessionLocked(ctx)
 }
 
 // Search posts one page of query results. start is the row offset, rows the
@@ -175,7 +267,15 @@ func (c *Client) EnsureSession() error {
 // session is the common failure, and rotating it once is cheaper than
 // pushing the error into the worker's retry ladder.
 func (c *Client) Search(query string, start, rows int) (*Page, error) {
-	page, err := c.searchOnce(query, start, rows)
+	return c.SearchContext(context.Background(), query, start, rows)
+}
+
+// SearchContext is Search with a caller-owned context. The prefetch pipeline
+// uses it to cancel pages that are still in flight when the walk stops early;
+// a canceled request must not renew the session behind the caller's back.
+func (c *Client) SearchContext(ctx context.Context, query string, start, rows int) (*Page, error) {
+	seen := c.sessionGeneration()
+	page, err := c.searchOnce(ctx, query, start, rows)
 	if err == nil {
 		return page, nil
 	}
@@ -185,15 +285,21 @@ func (c *Client) Search(query string, start, rows int) (*Page, error) {
 	if errors.Is(err, ErrNotJSON) || errors.Is(err, site.ErrAppError) || errors.Is(err, ErrBlocked) {
 		return nil, err
 	}
-	// Transport trouble or a bad status: start over with a fresh session.
-	if serr := c.EnsureSession(); serr != nil {
+	// The caller gave up (a walk stopped early, the process is shutting down):
+	// retrying the session would only delay that decision.
+	if ctx.Err() != nil {
 		return nil, err
 	}
-	return c.searchOnce(query, start, rows)
+	// Transport trouble or a bad status: start over with a fresh session,
+	// unless a concurrent page already did.
+	if serr := c.renewSession(ctx, seen); serr != nil {
+		return nil, err
+	}
+	return c.searchOnce(ctx, query, start, rows)
 }
 
-func (c *Client) searchOnce(query string, start, rows int) (*Page, error) {
-	raw, err := c.post(EncodeForm(State(query, start, rows)))
+func (c *Client) searchOnce(ctx context.Context, query string, start, rows int) (*Page, error) {
+	raw, err := c.post(ctx, EncodeForm(State(query, start, rows)))
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +307,8 @@ func (c *Client) searchOnce(query string, start, rows int) (*Page, error) {
 }
 
 // post sends one form body to select.jsp and returns the raw answer.
-func (c *Client) post(form string) ([]byte, error) {
-	req, err := http.NewRequest("POST", SelectURL, strings.NewReader(form))
+func (c *Client) post(ctx context.Context, form string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", SelectURL, strings.NewReader(form))
 	if err != nil {
 		return nil, err
 	}

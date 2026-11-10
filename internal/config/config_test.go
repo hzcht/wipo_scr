@@ -39,6 +39,9 @@ func TestDefaultsAreUsable(t *testing.T) {
 	if c.ProxyList != "proxy.lst" || c.Input != "task.txt" {
 		t.Errorf("unexpected defaults: input=%q proxy=%q", c.Input, c.ProxyList)
 	}
+	if c.PrefetchPages != 2 {
+		t.Errorf("prefetch_pages = %d, want the conservative default of 2", c.PrefetchPages)
+	}
 }
 
 func TestPrecedenceDefaultsTomlFlags(t *testing.T) {
@@ -158,6 +161,24 @@ func TestValidateRejectsUnusableSettings(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: Validate accepted it", name)
 		}
+	}
+}
+
+func TestPrefetchPagesPrecedenceAndValidation(t *testing.T) {
+	// Replay speed tuning: the TOML sets the window, a typed flag overrides it,
+	// and zero is a real value that turns the pipeline off.
+	c := parse(t, "prefetch_pages = 4\n")
+	if c.PrefetchPages != 4 {
+		t.Errorf("prefetch_pages = %d, want 4 from the TOML", c.PrefetchPages)
+	}
+	c = parse(t, "prefetch_pages = 4\n", "-prefetch-pages", "0")
+	if c.PrefetchPages != 0 {
+		t.Errorf("prefetch_pages = %d, want 0 from the flag — just in time", c.PrefetchPages)
+	}
+	bad := DefaultConfig()
+	bad.PrefetchPages = -1
+	if err := bad.Validate(); err == nil {
+		t.Error("Validate accepted a negative prefetch_pages")
 	}
 }
 

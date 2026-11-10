@@ -24,7 +24,14 @@ func (w *worker) navTimeout() time.Duration {
 // resultsTimeout is the budget for waiting on the results grid to appear or to
 // change, on the endpoint in use.
 func (w *worker) resultsTimeout() time.Duration {
-	return w.deps.Proxy.ScaleTimeout(w.proxy, time.Duration(w.deps.Cfg.ResultsTimeoutMS)*time.Millisecond)
+	return w.resultsTimeoutFor(w.proxy)
+}
+
+// resultsTimeoutFor is resultsTimeout for an endpoint captured at the start of
+// an attempt. The prefetch workers use it so they never read w.proxy while a
+// watchdog-abandoned attempt and a proxy rotation could still overlap.
+func (w *worker) resultsTimeoutFor(px string) time.Duration {
+	return w.deps.Proxy.ScaleTimeout(px, time.Duration(w.deps.Cfg.ResultsTimeoutMS)*time.Millisecond)
 }
 
 // noteStall records a step that ran long or ran out of time, so the next

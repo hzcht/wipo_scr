@@ -122,8 +122,12 @@ func TestSOCKS4IsReportedAsPortOnly(t *testing.T) {
 	if !portOnly {
 		t.Error("a SOCKS4 probe should report port-only: nothing verified the tunnel")
 	}
-	if latency <= 0 {
-		t.Errorf("latency = %s, want the connect time logged", latency)
+	// A loopback connect can finish inside one tick of the Windows clock, so
+	// time.Since legitimately reports zero there. What must never happen is a
+	// negative or absurd duration: this is the sample the pool sizes budgets
+	// from, and a bogus one would outlive the probe.
+	if latency < 0 || latency > 3*time.Second {
+		t.Errorf("latency = %s, want the measured connect time", latency)
 	}
 	if _, _, err := reachable("socks4://127.0.0.1:1", probeTarget, time.Second); err == nil {
 		t.Error("a closed SOCKS4 port was accepted")

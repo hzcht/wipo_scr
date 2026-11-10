@@ -27,6 +27,30 @@ func TestNewDropsDuplicatesAndBlanks(t *testing.T) {
 	}
 }
 
+// The precheck and the pool must see one endpoint set: probing duplicates
+// wastes a timeout per copy, and the log would report a list that is not the
+// list the rotation uses.
+func TestUniqueIsTheSetThePoolUses(t *testing.T) {
+	raw := []string{
+		" https://127.0.0.1:8443 ", "https://127.0.0.1:8443",
+		"", "http://127.0.0.1:8888", "socks5://127.0.0.1:1080",
+		"http://127.0.0.1:8888",
+	}
+	got := Unique(raw)
+	want := []string{"https://127.0.0.1:8443", "http://127.0.0.1:8888", "socks5://127.0.0.1:1080"}
+	if len(got) != len(want) {
+		t.Fatalf("Unique = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Unique = %q, want %q", got, want)
+		}
+	}
+	if p := New(raw, poolOpts(3, time.Minute)); p.Len() != len(got) {
+		t.Errorf("pool has %d endpoints, Unique returned %d", p.Len(), len(got))
+	}
+}
+
 func TestPickIsDirectWithoutProxies(t *testing.T) {
 	p := New(nil, poolOpts(3, time.Minute))
 	if got := p.Pick(); got != "" {

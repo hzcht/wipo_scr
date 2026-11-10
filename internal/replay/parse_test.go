@@ -31,3 +31,61 @@ func TestParsePageOtherErrorStaysNotJSON(t *testing.T) {
 		t.Fatalf("ParsePage = %v, want ErrNotJSON", err)
 	}
 }
+
+// stripHTML's byte-scan fast paths must be invisible in the output: every
+// branch still has to produce the title bytes the grid renders.
+func TestStripHTMLFastPaths(t *testing.T) {
+	cases := map[string]string{
+		"":                           "",
+		"PLAIN MARK":                 "PLAIN MARK",
+		`GRAND"MÈRE`:                 `GRAND'MÈRE`,
+		"<b>BOLD</b> MARK":           "BOLD MARK",
+		"<b></b>":                    "",
+		"&nbsp;":                     "",
+		"&#160;":                     "",
+		"&nbsp;<i>x</i>":             "&nbsp;x",
+		`<i title="a">quoted</i>`:    "quoted",
+		"<i>unclosed":                "unclosed", // the tag matched, the trailing text is not a tag
+		"no tags but \"quotes\": ok": "no tags but 'quotes': ok",
+	}
+	for in, want := range cases {
+		if got := stripHTML(in); got != want {
+			t.Errorf("stripHTML(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// viennaClass cuts codes with JS substring semantics; the allocation-free scan
+// has to agree with it at the boundary.
+func TestClipAndUTF16Len(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"21.052.01", 5, "21.05"},
+		{"21", 5, "21"},
+		{"", 5, ""},
+		{"abc", 0, ""},
+		{"€€€", 2, "€€"},
+		{"a€b", 2, "a€"},
+		{"a😀b", 2, "a"}, // a two-unit rune cannot be cut in half in a Go string
+	} {
+		if got := clip(tc.in, tc.n); got != tc.want {
+			t.Errorf("clip(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"abc", 3},
+		{"€€", 2},
+		{"a😀b", 4}, // one BMP unit each side, two for the emoji
+	} {
+		if got := utf16Len(tc.in); got != tc.want {
+			t.Errorf("utf16Len(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}

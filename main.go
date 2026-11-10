@@ -105,6 +105,17 @@ func main() {
 	// a budget sized for the fastest proxy in the list.
 	var pool *proxy.Pool
 	proxies, listErr := queue.LoadLines(cfg.ProxyList)
+	if listErr == nil {
+		// The list is a scrape and repeats its working entries heavily. Dedupe
+		// before the precheck, not only inside the pool: probing the same
+		// endpoint thirty times costs thirty timeouts and says nothing new.
+		unique := proxy.Unique(proxies)
+		if dropped := len(proxies) - len(unique); dropped > 0 {
+			log.Printf("proxy list %s: %d duplicate/blank entries dropped, %d unique endpoints",
+				cfg.ProxyList, dropped, len(unique))
+		}
+		proxies = unique
+	}
 	if listErr != nil || len(proxies) == 0 {
 		reason := "empty"
 		if listErr != nil {

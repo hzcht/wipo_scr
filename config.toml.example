@@ -58,6 +58,13 @@ rows_per_page = 100
 # Cap on result pages per query. 0 = walk every page.
 max_pages = 0
 
+# Replay only: how many result pages to fetch ahead of the page being written.
+# The round trip is what a page walk spends its time on, so keeping two in
+# flight overlaps them instead of queueing them. 0 fetches each page just in
+# time; raise it to overlap more, at the cost of more concurrent requests from
+# one IP. Browser mode ignores this: the page is already rendered there.
+prefetch_pages = 2
+
 # Minimum pause between two search submits from the same IP, plus jitter. WIPO
 # scores the source IP, so this is the main brake on getting blocked. Set the
 # gap to 0 to crawl at full speed and accept the block risk.

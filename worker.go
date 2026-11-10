@@ -320,6 +320,7 @@ func (w *worker) handle(t queue.Task) {
 		// the loser of the select never blocks, and the abandoned goroutine can
 		// only ever touch its own copy.
 		resultCh := make(chan attemptResult, 1)
+		attemptCtx, attemptCancel := context.WithCancel(context.Background())
 		w.at("start")
 		go func() {
 			var res attemptResult
@@ -329,7 +330,7 @@ func (w *worker) handle(t queue.Task) {
 				}
 				resultCh <- res
 			}()
-			res = w.attempt(&t)
+			res = w.attempt(attemptCtx, &t)
 		}()
 
 		// Poll often enough that a stall is noticed close to when the budget
@@ -362,6 +363,11 @@ func (w *worker) handle(t queue.Task) {
 				break watchdog
 			}
 		}
+		// Either the attempt has finished or the watchdog is abandoning it.
+		// Canceling here is what stops a replay prefetch (and its HTTP
+		// requests) from outliving the attempt the worker is about to grade;
+		// it is harmless after a normal return.
+		attemptCancel()
 		if timedOut {
 			// A separate value on purpose: the abandoned goroutine may still be
 			// inside w.attempt, and it owns the copy in resultCh.
@@ -719,8 +725,8 @@ type attemptResult struct {
 // a way that skips the loop's own check (a timeout on the home page, a dead
 // click), and the rules file should still get its say before the attempt is
 // written off as a plain failure.
-func (w *worker) attempt(t *queue.Task) attemptResult {
-	res := w.runAttempt(t)
+func (w *worker) attempt(ctx context.Context, t *queue.Task) attemptResult {
+	res := w.runAttempt(ctx, t)
 	if res.err == nil || res.action != "" {
 		return res
 	}
@@ -743,9 +749,9 @@ func (w *worker) attempt(t *queue.Task) attemptResult {
 // skip the navigation and only while the page still holds that box: a retry
 // always reloads, because a fresh navigation is how a failed attempt drops
 // whatever it left behind.
-func (w *worker) runAttempt(t *queue.Task) attemptResult {
+func (w *worker) runAttempt(ctx context.Context, t *queue.Task) attemptResult {
 	if w.deps.Cfg.Replay() {
-		res := w.replayAttempt(t)
+		res := w.replayAttempt(ctx, t)
 		if res.err == nil || !errors.Is(res.err, replay.ErrNotJSON) {
 			return res
 		}
@@ -754,8 +760,8 @@ func (w *worker) runAttempt(t *queue.Task) attemptResult {
 		// browser grades better: it gets a real session and a real fingerprint,
 		// and its own classifier decides what the page was. The HTTP session is
 		// dropped first so the next attempt does not reuse it either.
-		log.Printf("task %q attempt %d: %v — falling back to the browser", t.Name, t.Attempts, res.err)
-		w.rc = nil
+		log.Printf("task %q attempt %d: %v - falling back to the browser", t.Name, t.Attempts, res.err)
+		w.dropSession()
 		if !w.healthy() {
 			if err := w.launch(false); err != nil {
 				return attemptResult{err: fmt.Errorf("replay: %v (browser fallback: %w)", res.err, err)}
@@ -843,7 +849,7 @@ func (w *worker) ensureProfile() error {
 
 func (w *worker) replayClient() (*replay.Client, error) {
 	if w.rc != nil {
-		w.rc.Timeout = w.resultsTimeout()
+		w.rc.SetTimeout(w.resultsTimeout())
 		return w.rc, nil
 	}
 	if w.proxy == "" {
@@ -853,7 +859,7 @@ func (w *worker) replayClient() (*replay.Client, error) {
 		return nil, err
 	}
 	c := replay.NewClient(w.fp.UserAgent)
-	c.Timeout = w.resultsTimeout()
+	c.SetTimeout(w.resultsTimeout())
 	if err := c.SetProxy(w.proxy); err != nil {
 		log.Printf("worker %d: %v — replay goes through the environment instead", w.id, err)
 	}
@@ -868,21 +874,23 @@ func (w *worker) replayClient() (*replay.Client, error) {
 // replayAttempt runs one query straight against select.jsp: no browser, no
 // DOM, one HTTP round trip per result page. The contract mirrors runAttempt —
 // a clean count, errNoResults, or an error for handle() to grade.
-func (w *worker) replayAttempt(t *queue.Task) attemptResult {
-	if _, err := w.replayClient(); err != nil {
+func (w *worker) replayAttempt(ctx context.Context, t *queue.Task) attemptResult {
+	c, err := w.replayClient()
+	if err != nil {
 		return attemptResult{err: err}
 	}
 	// The gate brakes on the search, exactly as in the browser path: the site
 	// scores the source IP, and page walks are unguarded there too.
-	w.deps.Gate.Wait(w.proxy)
-	page, err := w.replaySearch(t.Name, 0, w.deps.Cfg.RowsPerPage)
+	proxy := w.proxy
+	w.deps.Gate.Wait(proxy)
+	page, err := w.replaySearch(ctx, c, proxy, t.Name, 0, w.deps.Cfg.RowsPerPage)
 	if err != nil {
 		return attemptResult{err: err}
 	}
 	if page.NumFound == 0 {
 		return attemptResult{err: errNoResults}
 	}
-	count, rows, partial, err := w.replayCollect(t, page)
+	count, rows, partial, err := w.replayCollect(ctx, t, c, proxy, page)
 	if err != nil {
 		return attemptResult{err: err}
 	}
@@ -892,18 +900,22 @@ func (w *worker) replayAttempt(t *queue.Task) attemptResult {
 // replaySearch fetches one page of rows at a row offset. The round trip is
 // timed: it is a step over the network like any other, so it feeds the
 // watchdog and the pool's latency sample the same way a page load does.
-func (w *worker) replaySearch(query string, start, rows int) (*replay.Page, error) {
-	c, err := w.replayClient()
-	if err != nil {
-		return nil, err
-	}
+//
+// The client is passed in rather than looked up per page: the prefetch
+// pipeline calls this from several goroutines, and fetching the worker's
+// session (which updates its deadline) on every call would race with itself.
+func (w *worker) replaySearch(ctx context.Context, c *replay.Client, px, query string, start, rows int) (*replay.Page, error) {
 	w.at(fmt.Sprintf("replay row %d", start))
+	// The endpoint's measured latency can change during a long walk. Updating
+	// the deadline here keeps the adaptive budget the sequential walk had,
+	// while the client makes the read safe for concurrent requests.
+	c.SetTimeout(w.resultsTimeoutFor(px))
 	pageStart := time.Now()
-	page, err := c.Search(query, start, rows)
+	page, err := c.SearchContext(ctx, query, start, rows)
 	if err != nil {
 		return nil, err
 	}
-	w.deps.Proxy.NoteLatency(w.proxy, time.Since(pageStart))
+	w.deps.Proxy.NoteLatency(px, time.Since(pageStart))
 	return page, nil
 }
 
@@ -924,7 +936,7 @@ func (w *worker) replaySearch(query string, start, rows int) (*replay.Page, erro
 // point on faith. The hole this replaced was exactly one page per violation —
 // an empty or clamped answer moved the checkpoint just as happily as a full
 // one, while results.txt went on claiming rows that were never written.
-func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, int, bool, error) {
+func (w *worker) replayCollect(ctx context.Context, t *queue.Task, c *replay.Client, px string, first *replay.Page) (int, int, bool, error) {
 	pageSize := w.deps.Cfg.RowsPerPage
 	if pageSize <= 0 {
 		pageSize = 100
@@ -961,7 +973,8 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, int, boo
 		}
 		from = resume + 1
 	}
-	if last := lastGridPage(count, pageSize); from > last {
+	last := lastGridPage(count, pageSize)
+	if from > last {
 		log.Printf("task %q: starting at page %d, past the last page %d of %d rows, nothing to collect",
 			t.Name, from, last, count)
 		return count, haveRows, false, nil
@@ -970,6 +983,33 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, int, boo
 		log.Printf("task %q: starting at page %d (range %d..%s, %d rows known)",
 			t.Name, from, from, pageBoundText(to), count)
 	}
+
+	// The page fetches run ahead of the writer; the writes themselves never
+	// do. Rows and checkpoints below still move strictly in grid order, and a
+	// page that finished early waits until every page before it is on disk.
+	//
+	// The pipeline owns the pages after the search that is already in hand
+	// (first), and stops at the same bounds the loop does: the site's last
+	// page, the configured range end, and max_pages — which is a cap on pages
+	// collected per shard, so it counts from from.
+	fetch := func(ctx context.Context, gridPage int) (*replay.Page, error) {
+		return w.replaySearch(ctx, c, px, t.Name, (gridPage-1)*pageSize, pageSize)
+	}
+	prefetchFirst := from
+	if first != nil && first.Start == (from-1)*pageSize {
+		prefetchFirst = from + 1
+	}
+	prefetchLast := last
+	if to > 0 && to < prefetchLast {
+		prefetchLast = to
+	}
+	if max := w.deps.Cfg.MaxPages; max > 0 {
+		if stop := from + max - 1; stop < prefetchLast {
+			prefetchLast = stop
+		}
+	}
+	pf := newPagePrefetcher(ctx, fetch, prefetchFirst, prefetchLast, w.deps.Cfg.PrefetchPages)
+	defer pf.Close()
 
 	start := time.Now()
 	collectedAt := time.Now()
@@ -995,7 +1035,12 @@ func (w *worker) replayCollect(t *queue.Task, first *replay.Page) (int, int, boo
 		if page == nil || page.Start != wantStart {
 			w.at(fmt.Sprintf("replay page %d", gridPage))
 			var err error
-			if page, err = w.replaySearch(t.Name, wantStart, pageSize); err != nil {
+			if pf != nil {
+				page, err = pf.Get(gridPage)
+			} else {
+				page, err = fetch(ctx, gridPage)
+			}
+			if err != nil {
 				return count, -1, false, err
 			}
 		}
@@ -1388,20 +1433,56 @@ func pageBoundText(to int) string {
 	return fmt.Sprintf("%d", to)
 }
 
-// switchProxy moves to a fresh endpoint on the same profile, so the warm
-// cookies stay. A new IP may earn one more block page, which the normal marker
-// path handles.
+// dropSession abandons the worker's HTTP session: the next attempt builds a new
+// one on the endpoint it picks. Cookies and idle connections belong to the old
+// IP, so they go with it — a parked connection is a live tunnel to an endpoint
+// the pool may already have cooled down.
+func (w *worker) dropSession() {
+	if w.rc != nil {
+		w.rc.Close()
+		w.rc = nil
+	}
+}
+
+// relaunchOnRotation reports whether a rotation should restart the browser
+// instead of only dropping the HTTP session.
+//
+// Only browser mode keeps a browser for the whole run, so a rotation there has
+// to move it to the new endpoint. Replay opens a browser on demand, from the
+// ErrNotJSON fallback, and that one stays open for the rest of the run — so
+// restarting it per rotation is pure cost.
+func (w *worker) relaunchOnRotation() bool {
+	return !w.deps.Cfg.Replay()
+}
+
+// switchProxy moves to a fresh endpoint. In browser mode the profile is kept
+// and only the browser restarts, so the warm cookies survive; a new IP may earn
+// one more block page, which the normal marker path handles.
+//
+// Replay mode is different in a way that used to cost real time. A browser is
+// only ever opened there by the ErrNotJSON fallback, and that browser stays
+// open for the rest of the run. Rotating through launch() then closed and
+// relaunched Chromium on every single 403 — 343 times in the run this was
+// measured on, about 384 s of pure restart, plus a headed Chromium resident the
+// whole time for 17 fallbacks in 10.5 h. In replay the browser is dropped
+// instead: the HTTP session is discarded, the next attempt re-picks the
+// endpoint and re-handshakes on the new IP, and a later fallback opens a fresh
+// browser on that endpoint (runAttempt relaunches when !healthy).
 func (w *worker) switchProxy() {
 	next := w.deps.Proxy.Pick()
 	if next == "" || next == w.proxy {
 		return
 	}
 	w.proxy = next
-	// Replay holds no browser to relaunch: the session is dropped instead, so
-	// the next attempt re-picks the endpoint and re-handshakes on the new IP.
-	// The browser, if one is open from a fallback, is rotated the usual way.
-	if w.ctx == nil && w.page == nil {
-		w.rc = nil
+	// The session is bound to the old IP: its cookies and its idle connections
+	// are worthless now. Dropping it is what makes the next attempt
+	// re-handshake through the new endpoint.
+	w.dropSession()
+	if !w.relaunchOnRotation() {
+		// The browser, if the fallback opened one, is closed rather than
+		// relaunched: nothing in replay needs it until another fallback, and
+		// that path opens it again on the endpoint picked above.
+		w.close()
 		return
 	}
 	if err := w.launch(false); err != nil {
@@ -1416,6 +1497,19 @@ func (w *worker) onBlockHit(taskName string) {
 	w.deps.Proxy.CoolDown(w.proxy)
 	w.blockRuns++
 	if w.blockRuns < blockStreak {
+		return
+	}
+	// Replay has no profile worth wiping — the fingerprint only supplies the
+	// user agent — so the identity that looked burned is the endpoint and the
+	// session. Both are dropped and the pool hands out a fresh endpoint on the
+	// next attempt; relaunching Chromium here would be the same 1 s of restart
+	// per streak that switchProxy no longer pays.
+	if w.deps.Cfg.Replay() {
+		log.Printf("worker %d: %d block pages in a row (task %q), dropping the session and the proxy",
+			w.id, w.blockRuns, taskName)
+		w.close()
+		w.dropSession()
+		w.proxy = ""
 		return
 	}
 	// Nothing to wipe when the block came in without a browser: replay has no

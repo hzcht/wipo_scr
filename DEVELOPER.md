@@ -5,6 +5,7 @@
 ```
 main.go          — точка входа, конфиг, пул прокси, запуск воркеров
 worker.go        — жизненный цикл попытки, ретраи, ватчдог, прокси-ротация
+prefetch.go      — упорядоченный конвейер страниц replay (fetch впереди записи)
 navigate.go      — браузерный путь: openHome, submitSearch, waitOutcome, пагинация
 internal/replay  — HTTP-движок (POST select.jsp, LZ-string, парсинг JSON)
 internal/site    — селекторы, парсеры грида/пейджера, классификатор страниц
@@ -19,7 +20,7 @@ internal/rules   — файл errors.lst: маркеры "action@::@text" для
 ## Ключевые инварианты
 
 1. **Режим replay — дефолт**. Browser запускается лениво (фоллбэк на `ErrNotJSON` / `ErrAppError`).
-2. **Чекпоинт пишется ПОСЛЕ строк** — потеря чекпоинта = ре-волк (дедуп поглощает), никогда не пропуск.
+2. **Чекпоинт пишется ПОСЛЕ строк** — потеря чекпоинта = ре-волк (дедуп поглощает), никогда не пропуск. Конвейер `prefetch_pages` качает страницы вперёд, но строки и чекпоинты по-прежнему идут строго по номеру страницы: ранний ответ ждёт в `pending`, ошибка отдаётся на своей странице.
 3. **Дедуп — первый вхождение** (`unique` как в JS гриде).
 4. **Прокси и браузер поворачиваются вместе** — тёплые куки живут только на своём IP.
 5. **Таймауты масштабируются** по EWMA латенси эндпоинта (`proxy.Pool.ScaleTimeout`).
@@ -45,7 +46,7 @@ internal/rules   — файл errors.lst: маркеры "action@::@text" для
 
 ```bash
 go build -o wipos.exe .
-gofmt -w .
+go fmt ./...          # не `gofmt -w .`: та обходит и data/ с миллионами файлов
 go vet ./...
 go test ./... -timeout 180s
 # race не работает (нет gcc)
@@ -53,7 +54,7 @@ go test ./... -timeout 180s
 #   Get-ChildItem -Recurse -Include *.go,*.md | % { if ([IO.File]::ReadAllText($_,[Text.Encoding]::UTF8).Contains([char]0xFFFD)) { $_.FullName } }
 ```
 
-**PowerShell-замены в .go файлах запрещены** — ломают UTF-8 (em-dash, ellipsis). Только editor tool + `gofmt -w .`.
+**PowerShell-замены в .go файлах запрещены** — ломают UTF-8 (em-dash, ellipsis). Только editor tool + `go fmt ./...`.
 
 ## Отладка
 
@@ -66,13 +67,14 @@ go test ./... -timeout 180s
 ## Горячие места при рефакторинге
 
 - `worker.go:handle()` — единая точка принятия решений о ретрае/прокси/блоке. Любая новая ошибка должна пройти через `pageErr` или sentinel.
+- `prefetch.go` — окно ограничено `prefetch_pages` от последней *потреблённой* страницы; `Close` обязан отменить и дождаться всех запросов, иначе воркер повернёт прокси под работающим HTTP-клиентом.
 - `navigate.go:waitOutcome` / `nextPage` / `gotoPage` — классификация **каждый опрос**. Не добавляйте ожиданий без неё.
 - `internal/replay/parse.go:rowFromDoc` — порядок приоритетов highlighting/doc/def **строго** как в бандле.
 - `internal/proxy/pool.go` — `ScaleTimeout`, `NoteSlow`, `SoftFail`/`Fail` неразрывно связаны с ватчдогом и `handle`.
 
 ## CI-подобный чек-лист перед пушем
 
-- [ ] `gofmt -w .` / `go vet ./...` / `go test ./...` зелёные
+- [ ] `go fmt ./...` / `go vet ./...` / `go test ./...` зелёные
 - [ ] `go build -o wipos.exe .` собирается
 - [ ] Нет U+FFFD в исходниках
 - [ ] `AGENTS.md` обновлён (селекторы, протокол, прокси, режимы ошибок)
